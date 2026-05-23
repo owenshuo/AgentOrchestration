@@ -1,0 +1,6 @@
+# Tracked, time-bound exceptions for dependency review overrides.
+#
+# Every active dependency-review override must have a matching entry here.
+# Keep this file free of secrets; use dependency coordinates and public issue
+# links instead of private scanner output.
+exceptions: []
