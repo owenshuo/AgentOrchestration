@@ -7,13 +7,28 @@ from uuid import uuid4
 
 
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(
+        self,
+        max_concurrent: int = 5,
+        max_results: int = 1000,
+        result_ttl: Optional[float] = 3600.0,
+    ):
+        if max_results < 1:
+            raise ValueError("max_results must be at least 1")
+        if result_ttl is not None and result_ttl <= 0:
+            raise ValueError("result_ttl must be positive or None")
+
         self.max_concurrent = max_concurrent
+        self.max_results = max_results
+        self.result_ttl = result_ttl
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._result_timestamps: Dict[str, float] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self, agent_id: str, task: Dict[str, Any], handler: Callable
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -22,14 +37,16 @@ class AgentExecutor:
             self._active_tasks[execution_id] = task_obj
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._store_result(execution_id, result)
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._store_result(execution_id, {"error": str(e)})
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self, exec_id: str, agent_id: str, task: Dict, handler: Callable
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -43,7 +60,41 @@ class AgentExecutor:
         }
 
     def get_result(self, execution_id: str) -> Optional[Any]:
+        self._prune_results()
         return self._results.get(execution_id)
+
+    def result_count(self) -> int:
+        self._prune_results()
+        return len(self._results)
+
+    def _store_result(self, execution_id: str, result: Any) -> None:
+        self._results[execution_id] = result
+        self._result_timestamps[execution_id] = time.time()
+        self._prune_results()
+
+    def _prune_results(self) -> None:
+        now = time.time()
+        if self.result_ttl is not None:
+            expired = [
+                execution_id
+                for execution_id, stored_at in self._result_timestamps.items()
+                if now - stored_at > self.result_ttl
+            ]
+            for execution_id in expired:
+                self._results.pop(execution_id, None)
+                self._result_timestamps.pop(execution_id, None)
+
+        excess = len(self._results) - self.max_results
+        if excess <= 0:
+            return
+
+        oldest = sorted(
+            self._result_timestamps,
+            key=lambda execution_id: self._result_timestamps[execution_id],
+        )
+        for execution_id in oldest[:excess]:
+            self._results.pop(execution_id, None)
+            self._result_timestamps.pop(execution_id, None)
 
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
@@ -56,7 +107,11 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(), return_exceptions=True
+            )
+        self._results.clear()
+        self._result_timestamps.clear()
 
 # 2019-01-31T14:19:34 update
 
