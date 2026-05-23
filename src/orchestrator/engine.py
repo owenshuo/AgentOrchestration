@@ -3,10 +3,11 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.webhooks import WebhookDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,7 @@ class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.webhooks = WebhookDispatcher()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -28,6 +30,16 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def register_webhook_endpoint(
+        self,
+        workspace_id: str,
+        callback: Callable[[Dict[str, Any]], Any],
+        **limits: Any,
+    ):
+        return self.webhooks.register_endpoint(
+            workspace_id, callback, **limits
+        )
 
     async def start(self) -> None:
         self._running = True
@@ -65,10 +77,31 @@ class OrchestrationEngine:
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
+            await self.webhooks.fanout(
+                workspace_id=task.get("workspace_id", "default"),
+                event_id=f"{task_id}:completed",
+                payload={
+                    "event": "task.completed",
+                    "task_id": task_id,
+                    "result": result,
+                    "internal_run_id": task.get("internal_run_id"),
+                },
+            )
+
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            await self.webhooks.fanout(
+                workspace_id=task.get("workspace_id", "default"),
+                event_id=f"{task_id}:failed",
+                payload={
+                    "event": "task.failed",
+                    "task_id": task_id,
+                    "error": str(e),
+                    "internal_run_id": task.get("internal_run_id"),
+                },
+            )
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +115,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 

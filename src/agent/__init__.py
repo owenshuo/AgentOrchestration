@@ -1,6 +1,6 @@
 """Agent lifecycle management module."""
 
-from .registry import AgentRegistry
+from .registry import AgentRegistry, AgentStatus  # noqa: F401
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
 from .sandbox import AgentSandbox
