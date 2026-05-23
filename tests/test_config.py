@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,27 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_to_redacted_dict_masks_sensitive_keys(self):
+        config = Config()
+        config.set("database.host", "localhost")
+        config.set("database.password", "super-secret")
+        config.set("services.api_key", "api-secret")
+        config.set("services.public_key", "public-value")
+        config.set(
+            "services.clients",
+            [{"name": "primary", "access_token": "client-token"}],
+        )
+
+        data = config.to_redacted_dict()
+
+        assert data["database"]["host"] == "localhost"
+        assert data["database"]["password"] == "********"
+        assert data["services"]["api_key"] == "********"
+        assert data["services"]["public_key"] == "public-value"
+        assert data["services"]["clients"][0]["name"] == "primary"
+        assert data["services"]["clients"][0]["access_token"] == "********"
+        assert config.to_dict()["database"]["password"] == "super-secret"
 
 # 2019-02-01T18:58:35 update
 

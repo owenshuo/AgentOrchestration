@@ -47,8 +47,59 @@ class Config:
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
+    _REDACTED_VALUE = "********"
+    _SENSITIVE_KEY_MARKERS = (
+        "authheader",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "credential",
+        "apikey",
+        "privatekey",
+        "accesskey",
+    )
+
+    @classmethod
+    def _is_sensitive_key(cls, key: str) -> bool:
+        normalized = "".join(char for char in key.lower() if char.isalnum())
+        return any(
+            marker in normalized
+            for marker in cls._SENSITIVE_KEY_MARKERS
+        )
+
+    @classmethod
+    def _redact_value(cls, key: str, value: Any) -> Any:
+        if cls._is_sensitive_key(key):
+            return cls._REDACTED_VALUE
+        if isinstance(value, dict):
+            return {
+                nested_key: cls._redact_value(str(nested_key), nested_value)
+                for nested_key, nested_value in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._redact_collection_item(item) for item in value]
+        return value
+
+    @classmethod
+    def _redact_collection_item(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                nested_key: cls._redact_value(str(nested_key), nested_value)
+                for nested_key, nested_value in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._redact_collection_item(item) for item in value]
+        return value
+
     def to_dict(self) -> Dict:
         return self._data
+
+    def to_redacted_dict(self) -> Dict:
+        return {
+            key: self._redact_value(str(key), value)
+            for key, value in self._data.items()
+        }
 
 # 2019-03-14T15:29:32 update
 
