@@ -11,13 +11,25 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    RUNNING_ROLLBACK = "running_rollback"
+    COMPENSATED = "compensated"
+    ROLLBACK_FAILED = "rollback_failed"
+    BLOCKED = "blocked"
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        compensation: Optional[Callable] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
+        self.compensation = compensation
         self.retries = retries
         self.timeout = timeout
         self.status = StepStatus.PENDING
@@ -33,6 +45,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_log: List[Dict[str, str]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -67,20 +80,98 @@ class WorkflowManager:
             return False
 
         workflow.status = StepStatus.RUNNING
+        completed_steps: List[WorkflowStep] = []
         for step in workflow.steps:
+            if workflow.status == StepStatus.ROLLBACK_FAILED:
+                step.status = StepStatus.BLOCKED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "downstream_blocked",
+                    "partial_rollback",
+                )
+                continue
+
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
+                completed_steps.append(step)
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                if self._compensate(workflow, completed_steps):
+                    workflow.status = StepStatus.FAILED
+                else:
+                    workflow.status = StepStatus.ROLLBACK_FAILED
+                    self._block_downstream(workflow, step)
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _compensate(
+        self, workflow: Workflow, completed_steps: List[WorkflowStep]
+    ) -> bool:
+        for step in reversed(completed_steps):
+            if step.compensation is None:
+                continue
+            try:
+                step.compensation(step.result)
+                step.status = StepStatus.COMPENSATED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "compensation_completed",
+                    "rollback",
+                )
+            except Exception as e:
+                step.error = str(e)
+                step.status = StepStatus.ROLLBACK_FAILED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "compensation_failed",
+                    "partial_rollback",
+                )
+                return False
+        return True
+
+    def _block_downstream(
+        self, workflow: Workflow, failed_step: WorkflowStep
+    ) -> None:
+        block = False
+        for step in workflow.steps:
+            if step is failed_step:
+                block = True
+                continue
+            if block and step.status == StepStatus.PENDING:
+                step.status = StepStatus.BLOCKED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "downstream_blocked",
+                    "partial_rollback",
+                )
+
+    def _record_audit(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+        event: str,
+        reason: str,
+    ) -> None:
+        workflow.audit_log.append(
+            {
+                "event": event,
+                "workflow_id": workflow.id,
+                "step_id": step.id,
+                "reason": reason,
+            }
+        )
+        if len(workflow.audit_log) > 100:
+            workflow.audit_log = workflow.audit_log[-100:]
 
 # 2019-03-27T19:58:07 update
 
