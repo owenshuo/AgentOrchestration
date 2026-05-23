@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,74 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_retry_counts_are_scoped_by_attempt_id(self):
+        self.scheduler._max_retries = 2
+        task_id = self.scheduler.enqueue({"type": "parallel", "priority": 4})
+        import asyncio
+
+        task = asyncio.run(self.scheduler.dequeue())
+        first_revision = task["revision"]
+
+        assert self.scheduler.fail(
+            task_id,
+            attempt_id="branch-a",
+            expected_revision=first_revision,
+            expected_lifecycle_state="in_flight",
+        )
+        assert self.scheduler.retry_count(task_id, "branch-a") == 1
+        assert self.scheduler.retry_count(task_id, "branch-b") == 0
+
+        task = asyncio.run(self.scheduler.dequeue())
+        second_revision = task["revision"]
+        assert self.scheduler.fail(
+            task_id,
+            attempt_id="branch-b",
+            expected_revision=second_revision,
+            expected_lifecycle_state="in_flight",
+        )
+
+        assert self.scheduler.retry_count(task_id, "branch-a") == 1
+        assert self.scheduler.retry_count(task_id, "branch-b") == 1
+        assert task["retry_attempt_id"] == "branch-b"
+
+    def test_stale_retry_transition_is_rejected_without_requeue(self):
+        task_id = self.scheduler.enqueue({"type": "parallel"})
+        import asyncio
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert not self.scheduler.fail(
+            task_id,
+            attempt_id="branch-a",
+            expected_revision=task["revision"] - 1,
+            expected_lifecycle_state="in_flight",
+        )
+
+        assert self.scheduler.retry_count(task_id, "branch-a") == 0
+        assert self.scheduler._in_flight[task_id] is task
+        audit = self.scheduler.retry_audit_records()[-1]
+        assert audit["decision"] == "rejected"
+        assert audit["reason"] == "revision_mismatch"
+        assert "payload" not in audit
+
+    def test_lifecycle_mismatch_rejects_without_private_data(self):
+        task_id = self.scheduler.enqueue(
+            {"type": "parallel", "payload": {"secret": "hidden"}}
+        )
+        import asyncio
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert not self.scheduler.fail(
+            task_id,
+            attempt_id="branch-a",
+            expected_revision=task["revision"],
+            expected_lifecycle_state="queued",
+        )
+
+        audit = self.scheduler.retry_audit_records()[-1]
+        assert audit["reason"] == "lifecycle_mismatch"
+        assert audit["observed_lifecycle_state"] == "in_flight"
+        assert "payload" not in audit
 
 # 2019-01-09T19:07:03 update
 

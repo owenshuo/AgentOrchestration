@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -36,25 +35,44 @@ class TaskScheduler:
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._retry_counts: Dict[str, Dict[str, int]] = {}
+        self._retry_audit: List[Dict[str, Any]] = []
+        self._retry_audit_limit = 100
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task.setdefault("revision", 0)
+        task["lifecycle_state"] = "queued"
+        self._push_task(task, queue, priority)
+        return task_id
 
+    def _push_task(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> None:
+        task["enqueued_at"] = time.time()
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +83,116 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["revision"] = task.get("revision", 0) + 1
+                task["lifecycle_state"] = "in_flight"
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        completed = self._in_flight.pop(task_id, None) is not None
+        if completed:
+            self._retry_counts.pop(task_id, None)
+        return completed
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        attempt_id: str = "default",
+        expected_revision: Optional[int] = None,
+        expected_lifecycle_state: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            self._record_retry_audit(
+                task_id, attempt_id, "rejected", "not_in_flight"
+            )
+            return False
+
+        if (
+            expected_revision is not None
+            and task.get("revision") != expected_revision
+        ):
+            self._record_retry_audit(
+                task_id,
+                attempt_id,
+                "rejected",
+                "revision_mismatch",
+                expected_revision=expected_revision,
+                observed_revision=task.get("revision"),
+            )
+            return False
+
+        if (
+            expected_lifecycle_state is not None
+            and task.get("lifecycle_state") != expected_lifecycle_state
+        ):
+            self._record_retry_audit(
+                task_id,
+                attempt_id,
+                "rejected",
+                "lifecycle_mismatch",
+                expected_lifecycle_state=expected_lifecycle_state,
+                observed_lifecycle_state=task.get("lifecycle_state"),
+            )
+            return False
+
+        task = self._in_flight.pop(task_id)
+        attempts = self._retry_counts.setdefault(task_id, {})
+        retry_count = attempts.get(attempt_id, 0) + 1
+        attempts[attempt_id] = retry_count
+        task["retries"] = retry_count
+        task["retry_attempt_id"] = attempt_id
+
+        if retry_count < self._max_retries:
+            task["revision"] = task.get("revision", 0) + 1
+            task["lifecycle_state"] = "queued"
+            self._push_task(task, queue, priority=task.get("priority", 0))
+            self._record_retry_audit(
+                task_id,
+                attempt_id,
+                "queued",
+                "retry_budget_available",
+                retry_count=retry_count,
+            )
+            return True
+
+        task["lifecycle_state"] = "failed"
+        self._record_retry_audit(
+            task_id,
+            attempt_id,
+            "rejected",
+            "max_retries_exhausted",
+            retry_count=retry_count,
+        )
         return False
+
+    def retry_count(self, task_id: str, attempt_id: str = "default") -> int:
+        return self._retry_counts.get(task_id, {}).get(attempt_id, 0)
+
+    def retry_audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._retry_audit)
+
+    def _record_retry_audit(
+        self,
+        task_id: str,
+        attempt_id: str,
+        decision: str,
+        reason: str,
+        **details: Any,
+    ) -> None:
+        record = {
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "decision": decision,
+            "reason": reason,
+            "created_at": time.time(),
+        }
+        record.update(details)
+        self._retry_audit.append(record)
+        if len(self._retry_audit) > self._retry_audit_limit:
+            self._retry_audit = self._retry_audit[-self._retry_audit_limit:]
 
 # 2019-04-25T08:37:12 update
 
