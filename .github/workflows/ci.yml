@@ -27,3 +27,19 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  runtime-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: agent-orchestrator:runtime-check
+      - name: Inspect runtime image caches
+        run: scripts/check_runtime_image_caches.sh agent-orchestrator:runtime-check

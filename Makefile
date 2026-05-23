@@ -1,4 +1,4 @@
-.PHONY: install test lint clean build run
+.PHONY: install test lint clean build run docker-build docker-check docker-up docker-down
 
 install:
 	uv sync
@@ -21,7 +21,10 @@ run:
 	uvicorn src.api.server:create_app --reload --host 0.0.0.0 --port 8000
 
 docker-build:
-	docker compose -f infra/docker-compose.yml build
+	docker build -t agent-orchestrator:runtime .
+
+docker-check: docker-build
+	scripts/check_runtime_image_caches.sh agent-orchestrator:runtime
 
 docker-up:
 	docker compose -f infra/docker-compose.yml up -d
