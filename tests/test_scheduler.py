@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -29,6 +28,45 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
+
+    def test_scheduled_task_uses_monotonic_time_for_clock_adjustments(self):
+        now = [100.0]
+        scheduler = TaskScheduler(clock=lambda: now[0])
+        scheduler.schedule({"type": "heartbeat"}, delay=5.0)
+
+        now[0] = 104.0
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        now[0] = 105.0
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["type"] == "heartbeat"
+        assert task["retries"] == 0
+        assert scheduler.audit_records[-1]["action"] == "released"
+        assert (
+            scheduler.audit_records[-1]["component"]
+            == "scheduler.heartbeat"
+        )
+
+    def test_scheduled_task_preserves_payload_on_release(self):
+        now = [10.0]
+        scheduler = TaskScheduler(clock=lambda: now[0])
+        task_id = scheduler.schedule(
+            {"type": "heartbeat", "payload": {"agent": "worker-1"}},
+            delay=1.0,
+            queue="heartbeats",
+            priority=7,
+        )
+
+        now[0] = 11.0
+        import asyncio
+        task = asyncio.run(scheduler.dequeue(queue="heartbeats"))
+
+        assert task["id"] == task_id
+        assert task["payload"] == {"agent": "worker-1"}
+        assert scheduler.complete(task_id)
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})

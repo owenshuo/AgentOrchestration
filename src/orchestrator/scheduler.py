@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,16 +30,20 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._audit_records: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._clock()
         task["retries"] = 0
 
         if queue not in self._queues:
@@ -48,19 +51,40 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["retries"] = 0
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "due_at": self._clock() + delay,
+        }
+        self._audit("scheduled", task_id, queue=queue)
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            tid
+            for tid, entry in self._scheduled.items()
+            if entry["queue"] == queue and entry["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            entry = self._scheduled.pop(tid)
+            self._enqueue_existing(
+                entry["task"], queue, priority=entry["priority"]
+            )
+            self._audit("released", tid, queue=queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -77,9 +101,32 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._enqueue_existing(
+                    task, queue, priority=task.get("priority", 0)
+                )
                 return True
         return False
+
+    @property
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
+    def _enqueue_existing(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> None:
+        task["enqueued_at"] = self._clock()
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+
+    def _audit(self, action: str, task_id: str, **metadata: Any) -> None:
+        record = {
+            "component": "scheduler.heartbeat",
+            "action": action,
+            "task_id": task_id,
+        }
+        record.update(metadata)
+        self._audit_records.append(record)
 
 # 2019-04-25T08:37:12 update
 
