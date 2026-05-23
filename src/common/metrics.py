@@ -2,13 +2,15 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from threading import RLock
+from typing import Dict, List, Optional
 
 
 class MetricsCollector:
+    DEFAULT_EXPORTER_MAX_COUNTER = 2**63 - 1
+
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
@@ -38,13 +40,40 @@ class MetricsCollector:
                 return duration
         return 0.0
 
-    def snapshot(self) -> Dict:
+    def _validate_exporter_counter_ranges(
+        self,
+        max_counter_value: int,
+    ) -> None:
+        for metric, value in self._counters.items():
+            if value > max_counter_value:
+                raise OverflowError(
+                    f"Counter '{metric}' value {value} exceeds "
+                    f"exporter max {max_counter_value}"
+                )
+
+    def snapshot(
+        self,
+        *,
+        exporter_mode: bool = False,
+        max_counter_value: Optional[int] = None,
+    ) -> Dict:
         with self._lock:
+            if exporter_mode:
+                max_value = (
+                    max_counter_value or self.DEFAULT_EXPORTER_MAX_COUNTER
+                )
+                self._validate_exporter_counter_ranges(max_value)
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
 
 

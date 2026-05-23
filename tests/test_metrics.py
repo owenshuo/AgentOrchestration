@@ -31,6 +31,33 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_exporter_snapshot_rejects_counter_above_default_range(self):
+        self.metrics.increment(
+            "events.total",
+            MetricsCollector.DEFAULT_EXPORTER_MAX_COUNTER + 1,
+        )
+
+        with pytest.raises(OverflowError, match="events.total"):
+            self.metrics.snapshot(exporter_mode=True)
+
+    def test_regular_snapshot_preserves_large_python_counters(self):
+        value = MetricsCollector.DEFAULT_EXPORTER_MAX_COUNTER + 1
+        self.metrics.increment("events.total", value)
+
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["counters"]["events.total"] == value
+
+    def test_exporter_snapshot_allows_custom_counter_range(self):
+        self.metrics.increment("events.total", 11)
+
+        snapshot = self.metrics.snapshot(
+            exporter_mode=True,
+            max_counter_value=11,
+        )
+
+        assert snapshot["counters"]["events.total"] == 11
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update
