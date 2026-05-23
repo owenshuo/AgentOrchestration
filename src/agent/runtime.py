@@ -4,8 +4,10 @@ import os
 import signal
 import subprocess
 import logging
+import time
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -16,15 +18,34 @@ class RuntimeState(Enum):
     RUNNING = "running"
     STOPPING = "stopping"
     CRASHED = "crashed"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    run_id: str
+    agent_id: str
+    state: RuntimeState
+    reason: str
+    timestamp: float
+    pid: Optional[int] = None
 
 
 class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._terminal_outcomes: Dict[str, RunOutcome] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+    ) -> bool:
+        current_process = self._processes.get(agent_id)
+        if current_process and current_process.poll() is None:
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
@@ -40,6 +61,7 @@ class AgentRuntime:
                 env=process_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
             self._processes[agent_id] = proc
             self._states[agent_id] = RuntimeState.RUNNING
@@ -56,26 +78,106 @@ class AgentRuntime:
             return False
 
         self._states[agent_id] = RuntimeState.STOPPING
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        self._terminate_process_tree(proc, timeout=timeout)
 
         self._states[agent_id] = RuntimeState.STOPPED
         logger.info(f"Agent {agent_id} stopped")
         return True
 
+    def cancel_after_timeout(
+        self,
+        agent_id: str,
+        run_id: str,
+        timeout: int,
+        grace_period: int = 2,
+    ) -> RunOutcome:
+        existing = self._terminal_outcomes.get(run_id)
+        if existing:
+            self._audit(
+                "timeout_cancel_idempotent",
+                agent_id,
+                run_id,
+                existing.pid,
+            )
+            return existing
+
+        proc = self._processes.get(agent_id)
+        outcome = RunOutcome(
+            run_id=run_id,
+            agent_id=agent_id,
+            state=RuntimeState.TIMED_OUT,
+            reason=f"run timed out after {timeout}s",
+            timestamp=time.time(),
+            pid=proc.pid if proc else None,
+        )
+        self._terminal_outcomes[run_id] = outcome
+        self._states[agent_id] = RuntimeState.TIMED_OUT
+        self._audit("timeout_terminal_recorded", agent_id, run_id, outcome.pid)
+
+        if proc and proc.poll() is None:
+            self._terminate_process_tree(proc, timeout=grace_period)
+            self._audit(
+                "timeout_process_reaped",
+                agent_id,
+                run_id,
+                outcome.pid,
+            )
+        self._processes.pop(agent_id, None)
+        return outcome
+
+    def get_terminal_outcome(self, run_id: str) -> Optional[RunOutcome]:
+        return self._terminal_outcomes.get(run_id)
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
     def get_state(self, agent_id: str) -> RuntimeState:
         proc = self._processes.get(agent_id)
-        if proc and proc.poll() is not None:
+        current = self._states.get(agent_id, RuntimeState.STOPPED)
+        crashable = {RuntimeState.STARTING, RuntimeState.RUNNING}
+        if proc and proc.poll() is not None and current in crashable:
             self._states[agent_id] = RuntimeState.CRASHED
         return self._states.get(agent_id, RuntimeState.STOPPED)
 
     def is_running(self, agent_id: str) -> bool:
         proc = self._processes.get(agent_id)
         return proc is not None and proc.poll() is None
+
+    def _terminate_process_tree(
+        self,
+        proc: subprocess.Popen,
+        timeout: int,
+    ) -> None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            return
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(pgid, signal.SIGKILL)
+            proc.wait()
+        except ProcessLookupError:
+            pass
+
+    def _audit(
+        self,
+        event: str,
+        agent_id: str,
+        run_id: str,
+        pid: Optional[int],
+    ) -> None:
+        self._audit_records.append(
+            {
+                "event": event,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "pid": pid,
+                "timestamp": time.time(),
+            }
+        )
 
 # 2019-01-11T10:56:26 update
 
