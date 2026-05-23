@@ -1,10 +1,13 @@
-"""Task Scheduler — Priority-based task queuing and dispatch."""
+"""Task Scheduler - Priority-based task queuing and dispatch."""
 
-import asyncio
+from dataclasses import dataclass
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+
+TERMINAL_LIFECYCLE_STATES = {"cancelled", "completed", "deleted", "failed"}
 
 
 class PriorityQueue:
@@ -26,60 +29,256 @@ class PriorityQueue:
             return self._queue[0][2]
         return None
 
+    def remove_matching(self, predicate: Callable[[Any], bool]) -> int:
+        retained = []
+        removed = 0
+        for entry in self._queue:
+            if predicate(entry[2]):
+                removed += 1
+            else:
+                retained.append(entry)
+        if removed:
+            self._queue = retained
+            heapq.heapify(self._queue)
+        return removed
+
     def __len__(self) -> int:
         return len(self._queue)
 
 
-class TaskScheduler:
-    def __init__(self):
-        self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
-        self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+@dataclass(frozen=True)
+class ScheduledTask:
+    task: Dict[str, Any]
+    run_at: float
+    queue: str
+    priority: int
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+
+@dataclass(frozen=True)
+class WorkflowDeletionTombstone:
+    workflow_id: str
+    revision: int
+    attempt: int
+    lifecycle_state: str
+    deleted_at: float
+
+
+class TaskScheduler:
+    def __init__(self, clock: Callable[[], float] = time.time):
+        self._queues: Dict[str, PriorityQueue] = {}
+        self._scheduled: Dict[str, ScheduledTask] = {}
+        self._in_flight: Dict[str, Dict] = {}
+        self._workflow_deletions: Dict[str, WorkflowDeletionTombstone] = {}
+        self._audit_events: List[Dict[str, Any]] = []
+        self._max_retries = 3
+        self._clock = clock
+
+    @property
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return list(self._audit_events)
+
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> Optional[str]:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = self._clock()
+        task["retries"] = task.get("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+
+        if self._reject_stale_poll_transition(task, "enqueue"):
+            return None
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> Optional[str]:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["enqueued_at"] = self._clock()
+        task["retries"] = task.get("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+
+        if self._reject_stale_poll_transition(task, "schedule"):
+            return None
+
+        self._scheduled[task_id] = ScheduledTask(
+            task=task,
+            run_at=self._clock() + delay,
+            queue=queue,
+            priority=priority,
+        )
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    def mark_workflow_deleted(
+        self,
+        workflow_id: str,
+        revision: int = 0,
+        attempt: int = 0,
+        lifecycle_state: str = "deleted",
+    ) -> int:
+        existing = self._workflow_deletions.get(workflow_id)
+        if existing and (
+            existing.revision,
+            existing.attempt,
+        ) > (revision, attempt):
+            tombstone = existing
+        else:
+            tombstone = WorkflowDeletionTombstone(
+                workflow_id=workflow_id,
+                revision=revision,
+                attempt=attempt,
+                lifecycle_state=lifecycle_state,
+                deleted_at=self._clock(),
+            )
+            self._workflow_deletions[workflow_id] = tombstone
+        removed = self._remove_stale_poll_transitions(tombstone)
+        self._audit_events.append(
+            {
+                "decision": "workflow_deleted",
+                "workflow_id": workflow_id,
+                "revision": tombstone.revision,
+                "attempt": tombstone.attempt,
+                "lifecycle_state": tombstone.lifecycle_state,
+                "removed_poll_tasks": removed,
+            }
+        )
+        return removed
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            tid for tid, scheduled in self._scheduled.items()
+            if scheduled.run_at <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            if self._reject_stale_poll_transition(scheduled.task, "dequeue"):
+                continue
+            if scheduled.queue not in self._queues:
+                self._queues[scheduled.queue] = PriorityQueue()
+            self._queues[scheduled.queue].push(
+                scheduled.task,
+                scheduled.priority,
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
+            while len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if not task:
+                    continue
+                if self._reject_stale_poll_transition(task, "dequeue"):
+                    continue
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
+        task = self._in_flight.get(task_id)
+        if task and self._reject_stale_poll_transition(task, "complete"):
+            self._in_flight.pop(task_id, None)
+            return False
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
+            if self._reject_stale_poll_transition(task, "retry"):
+                return False
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+                task_id = self.enqueue(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
+                return task_id is not None
         return False
+
+    def _remove_stale_poll_transitions(
+        self,
+        tombstone: WorkflowDeletionTombstone,
+    ) -> int:
+        removed = 0
+        for task_queue in self._queues.values():
+            removed += task_queue.remove_matching(
+                lambda task: self._is_stale_poll_transition(task, tombstone)
+            )
+        for task_id, scheduled in list(self._scheduled.items()):
+            if self._is_stale_poll_transition(scheduled.task, tombstone):
+                self._scheduled.pop(task_id, None)
+                removed += 1
+        for task_id, task in list(self._in_flight.items()):
+            if self._is_stale_poll_transition(task, tombstone):
+                self._in_flight.pop(task_id, None)
+                removed += 1
+        return removed
+
+    def _reject_stale_poll_transition(self, task: Dict, action: str) -> bool:
+        workflow_id = task.get("workflow_id")
+        tombstone = self._workflow_deletions.get(workflow_id)
+        if not tombstone:
+            return False
+        if not self._is_stale_poll_transition(task, tombstone):
+            return False
+
+        self._audit_events.append(
+            {
+                "decision": "rejected",
+                "reason": "workflow_deleted",
+                "action": action,
+                "task_id": task.get("id"),
+                "workflow_id": workflow_id,
+                "workflow_revision": int(task.get("workflow_revision", 0)),
+                "workflow_attempt": int(task.get("workflow_attempt", 0)),
+                "lifecycle_state": task.get("lifecycle_state", "unknown"),
+                "deleted_revision": tombstone.revision,
+                "deleted_attempt": tombstone.attempt,
+                "deleted_lifecycle_state": tombstone.lifecycle_state,
+            }
+        )
+        return True
+
+    def _is_stale_poll_transition(
+        self,
+        task: Dict,
+        tombstone: WorkflowDeletionTombstone,
+    ) -> bool:
+        if not self._is_poll_transition(task):
+            return False
+        if task.get("workflow_id") != tombstone.workflow_id:
+            return False
+        if task.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES:
+            return False
+
+        task_revision = int(task.get("workflow_revision", 0))
+        task_attempt = int(task.get("workflow_attempt", 0))
+        if task_revision < tombstone.revision:
+            return True
+        if task_revision > tombstone.revision:
+            return False
+        return task_attempt <= tombstone.attempt
+
+    @staticmethod
+    def _is_poll_transition(task: Dict) -> bool:
+        return task.get("type") == "poll" or task.get("transition") == "poll"
 
 # 2019-04-25T08:37:12 update
 

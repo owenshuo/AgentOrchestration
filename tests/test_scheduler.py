@@ -1,10 +1,21 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 class TestTaskScheduler:
     def setup_method(self):
-        self.scheduler = TaskScheduler()
+        self.clock = FakeClock()
+        self.scheduler = TaskScheduler(clock=self.clock)
 
     def test_enqueue_task(self):
         task_id = self.scheduler.enqueue({"type": "test", "payload": {}})
@@ -35,6 +46,192 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_deleted_workflow_prunes_queued_poll_without_payload_audit(self):
+        self.scheduler.enqueue(
+            {
+                "type": "poll",
+                "workflow_id": "workflow-1",
+                "workflow_revision": 3,
+                "workflow_attempt": 1,
+                "lifecycle_state": "running",
+                "payload": {"private": "do not audit"},
+            }
+        )
+
+        removed = self.scheduler.mark_workflow_deleted(
+            "workflow-1",
+            revision=3,
+            attempt=1,
+        )
+
+        import asyncio
+        assert removed == 1
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        audit = self.scheduler.audit_events[-1]
+        assert audit["decision"] == "workflow_deleted"
+        assert audit["removed_poll_tasks"] == 1
+        assert "payload" not in audit
+
+    def test_deleted_workflow_rejects_late_poll_transition(self):
+        self.scheduler.mark_workflow_deleted(
+            "workflow-2",
+            revision=2,
+            attempt=4,
+        )
+        poll_task = {
+            "type": "poll",
+            "workflow_id": "workflow-2",
+            "workflow_revision": 2,
+            "workflow_attempt": 4,
+            "lifecycle_state": "running",
+            "payload": {"private": "do not audit"},
+        }
+
+        task_id = self.scheduler.enqueue(poll_task)
+
+        assert task_id is None
+        assert poll_task["lifecycle_state"] == "running"
+        audit = self.scheduler.audit_events[-1]
+        assert audit["decision"] == "rejected"
+        assert audit["reason"] == "workflow_deleted"
+        assert audit["action"] == "enqueue"
+        assert audit["workflow_id"] == "workflow-2"
+        assert audit["workflow_revision"] == 2
+        assert audit["workflow_attempt"] == 4
+        assert "payload" not in audit
+
+    def test_deleted_workflow_rejects_due_scheduled_poll(self):
+        self.scheduler.schedule(
+            {
+                "type": "poll",
+                "workflow_id": "workflow-3",
+                "workflow_revision": 5,
+                "workflow_attempt": 1,
+                "lifecycle_state": "running",
+            },
+            delay=10,
+        )
+        self.scheduler.mark_workflow_deleted(
+            "workflow-3",
+            revision=5,
+            attempt=1,
+        )
+        self.clock.advance(10)
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_deleted_workflow_rejects_in_flight_completion(self):
+        self.scheduler.enqueue(
+            {
+                "type": "poll",
+                "workflow_id": "workflow-4",
+                "workflow_revision": 1,
+                "workflow_attempt": 1,
+                "lifecycle_state": "running",
+            }
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        removed = self.scheduler.mark_workflow_deleted(
+            "workflow-4",
+            revision=1,
+            attempt=1,
+        )
+
+        assert removed == 1
+        assert self.scheduler.complete(task["id"]) is False
+
+    def test_deleted_workflow_rejects_retry_and_does_not_requeue(self):
+        self.scheduler.enqueue(
+            {
+                "type": "poll",
+                "workflow_id": "workflow-5",
+                "workflow_revision": 9,
+                "workflow_attempt": 2,
+                "lifecycle_state": "running",
+            }
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        self.scheduler.mark_workflow_deleted(
+            "workflow-5",
+            revision=9,
+            attempt=2,
+        )
+
+        assert self.scheduler.fail(task["id"]) is False
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_deleted_workflow_allows_newer_revision_poll(self):
+        self.scheduler.mark_workflow_deleted(
+            "workflow-6",
+            revision=3,
+            attempt=1,
+        )
+        task_id = self.scheduler.enqueue(
+            {
+                "type": "poll",
+                "workflow_id": "workflow-6",
+                "workflow_revision": 4,
+                "workflow_attempt": 1,
+                "lifecycle_state": "running",
+            }
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task_id is not None
+        assert task["workflow_revision"] == 4
+
+    def test_late_older_cleanup_cannot_downgrade_tombstone(self):
+        self.scheduler.mark_workflow_deleted(
+            "workflow-8",
+            revision=5,
+            attempt=3,
+        )
+        self.scheduler.mark_workflow_deleted(
+            "workflow-8",
+            revision=4,
+            attempt=9,
+        )
+
+        task_id = self.scheduler.enqueue(
+            {
+                "type": "poll",
+                "workflow_id": "workflow-8",
+                "workflow_revision": 5,
+                "workflow_attempt": 3,
+                "lifecycle_state": "running",
+            }
+        )
+
+        assert task_id is None
+        assert self.scheduler.audit_events[-1]["deleted_revision"] == 5
+        assert self.scheduler.audit_events[-1]["deleted_attempt"] == 3
+
+    def test_deleted_workflow_does_not_drop_non_poll_task(self):
+        task_id = self.scheduler.enqueue(
+            {
+                "type": "execute",
+                "workflow_id": "workflow-7",
+                "workflow_revision": 1,
+                "workflow_attempt": 1,
+                "lifecycle_state": "running",
+            }
+        )
+        self.scheduler.mark_workflow_deleted(
+            "workflow-7",
+            revision=1,
+            attempt=1,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task_id is not None
+        assert task["type"] == "execute"
 
 # 2019-01-09T19:07:03 update
 
