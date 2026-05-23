@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -13,6 +12,26 @@ class TestConfig:
     def test_default_value(self):
         config = Config()
         assert config.get("nonexistent.key", "default") == "default"
+
+    def test_env_override_coerces_integer(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_PORT", "8080")
+        config = Config()
+        assert config.get("app.port") == 8080
+        assert isinstance(config.get("app.port"), int)
+
+    def test_env_override_coerces_float(self, monkeypatch):
+        monkeypatch.setenv("AO_LIMITS_CPU", "0.75")
+        monkeypatch.setenv("AO_LIMITS_TIMEOUT", "1e3")
+        config = Config()
+        assert config.get("limits.cpu") == 0.75
+        assert config.get("limits.timeout") == 1000.0
+
+    def test_env_override_preserves_non_numeric_strings(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_HOST", "127.0.0.1:8080")
+        monkeypatch.setenv("AO_FEATURE_FLAG", "true")
+        config = Config()
+        assert config.get("app.host") == "127.0.0.1:8080"
+        assert config.get("feature.flag") == "true"
 
     def test_set_value(self):
         config = Config()
