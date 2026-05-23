@@ -1,22 +1,70 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Request, Response
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.export_audit import ExportAccessError, export_downloads
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
+def _download_actor(request: Request) -> str:
+    return request.headers.get("X-Actor-ID", "unknown")
+
+
+def _export_response(export_id: str, content: bytes) -> Response:
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename={export_id}.bin",
+        },
+    )
+
+
+@router.get("/exports/{export_id}/download")
+async def download_export(export_id: str, request: Request):
+    actor = _download_actor(request)
+    try:
+        content = export_downloads.download_for_actor(export_id, actor)
+    except ExportAccessError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=error.detail,
+        ) from error
+    return _export_response(export_id, content)
+
+
+@router.get("/exports/direct/{token}")
+async def download_export_direct(token: str, request: Request):
+    actor = _download_actor(request)
+    try:
+        content = export_downloads.download_with_token(token, actor)
+    except ExportAccessError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=error.detail,
+        ) from error
+    return _export_response(token, content)
+
+
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
