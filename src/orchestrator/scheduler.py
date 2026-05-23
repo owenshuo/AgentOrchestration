@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -36,25 +35,133 @@ class TaskScheduler:
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._workflow_states: Dict[str, Dict[str, Any]] = {}
+        self._run_audit: List[Dict[str, Any]] = []
+        self._run_audit_limit = 100
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        self._push_task(task, queue, priority)
+        return task_id
 
+    def _push_task(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
+
+    def set_workflow_state(
+        self,
+        workflow_id: str,
+        lifecycle_state: str = "active",
+        revision: int = 0,
+    ) -> None:
+        self._workflow_states[workflow_id] = {
+            "lifecycle_state": lifecycle_state,
+            "revision": revision,
+        }
+
+    def delete_workflow(self, workflow_id: str) -> None:
+        current = self._workflow_states.get(workflow_id, {})
+        self._workflow_states[workflow_id] = {
+            "lifecycle_state": "deleted",
+            "revision": current.get("revision", 0) + 1,
+        }
+
+    def materialize_run(
+        self,
+        workflow_id: str,
+        task: Dict,
+        expected_revision: int,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> Optional[str]:
+        state = self._workflow_states.get(workflow_id)
+        if state is None:
+            self._record_run_audit(
+                workflow_id,
+                "rejected",
+                "workflow_missing",
+                expected_revision=expected_revision,
+            )
+            return None
+
+        if state.get("lifecycle_state") != "active":
+            self._record_run_audit(
+                workflow_id,
+                "rejected",
+                "workflow_not_active",
+                expected_revision=expected_revision,
+                observed_lifecycle_state=state.get("lifecycle_state"),
+                observed_revision=state.get("revision"),
+            )
+            return None
+
+        if state.get("revision") != expected_revision:
+            self._record_run_audit(
+                workflow_id,
+                "rejected",
+                "workflow_revision_mismatch",
+                expected_revision=expected_revision,
+                observed_revision=state.get("revision"),
+            )
+            return None
+
+        run_task = dict(task)
+        run_task["workflow_id"] = workflow_id
+        run_task["workflow_revision"] = expected_revision
+        task_id = self.enqueue(run_task, queue=queue, priority=priority)
+        self._record_run_audit(
+            workflow_id,
+            "queued",
+            "workflow_precondition_matched",
+            observed_revision=expected_revision,
+            task_id=task_id,
+        )
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def run_audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._run_audit)
+
+    def _record_run_audit(
+        self,
+        workflow_id: str,
+        decision: str,
+        reason: str,
+        **details: Any,
+    ) -> None:
+        record = {
+            "workflow_id": workflow_id,
+            "decision": decision,
+            "reason": reason,
+            "created_at": time.time(),
+        }
+        record.update(details)
+        self._run_audit.append(record)
+        if len(self._run_audit) > self._run_audit_limit:
+            self._run_audit = self._run_audit[-self._run_audit_limit:]
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:

@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,56 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_materialize_run_rejects_deleted_workflow_race(self):
+        self.scheduler.set_workflow_state("workflow-1", revision=7)
+        self.scheduler.delete_workflow("workflow-1")
+
+        task_id = self.scheduler.materialize_run(
+            "workflow-1",
+            {"type": "run", "payload": {"secret": "hidden"}},
+            expected_revision=7,
+        )
+
+        assert task_id is None
+        assert "default" not in self.scheduler._queues
+        audit = self.scheduler.run_audit_records()[-1]
+        assert audit["decision"] == "rejected"
+        assert audit["reason"] == "workflow_not_active"
+        assert audit["observed_lifecycle_state"] == "deleted"
+        assert "payload" not in audit
+
+    def test_materialize_run_rejects_stale_workflow_revision(self):
+        self.scheduler.set_workflow_state("workflow-1", revision=4)
+
+        task_id = self.scheduler.materialize_run(
+            "workflow-1", {"type": "run"}, expected_revision=3
+        )
+
+        assert task_id is None
+        assert "default" not in self.scheduler._queues
+        audit = self.scheduler.run_audit_records()[-1]
+        assert audit["reason"] == "workflow_revision_mismatch"
+        assert audit["observed_revision"] == 4
+        assert audit["expected_revision"] == 3
+
+    def test_materialize_run_queues_when_precondition_matches(self):
+        self.scheduler.set_workflow_state("workflow-1", revision=2)
+
+        task_id = self.scheduler.materialize_run(
+            "workflow-1", {"type": "run"}, expected_revision=2
+        )
+        import asyncio
+
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task_id is not None
+        assert task["id"] == task_id
+        assert task["workflow_id"] == "workflow-1"
+        assert task["workflow_revision"] == 2
+        audit = self.scheduler.run_audit_records()[-1]
+        assert audit["decision"] == "queued"
+        assert audit["reason"] == "workflow_precondition_matched"
 
 # 2019-01-09T19:07:03 update
 
