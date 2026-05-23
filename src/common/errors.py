@@ -1,5 +1,7 @@
 """Custom exception definitions."""
 
+from typing import Optional
+
 
 class AgentOrchestratorError(Exception):
     """Base exception for all platform errors."""
@@ -40,6 +42,54 @@ class RateLimitError(AgentOrchestratorError):
 class ResourceExhaustedError(AgentOrchestratorError):
     def __init__(self, resource: str):
         super().__init__(f"Resource exhausted: {resource}")
+
+
+class ArtifactNotFoundError(AgentOrchestratorError):
+    def __init__(
+        self,
+        artifact_id: str,
+        region: str,
+        metadata_state: str,
+        origin_region: Optional[str] = None,
+        replication_age_seconds: Optional[float] = None,
+    ):
+        details = [
+            f"artifact_id={artifact_id}",
+            f"region={region}",
+            f"metadata_state={metadata_state}",
+        ]
+        if origin_region is not None:
+            details.append(f"origin_region={origin_region}")
+        if replication_age_seconds is not None:
+            details.append(
+                f"replication_age_seconds={replication_age_seconds:.3f}"
+            )
+        super().__init__("Artifact not found (" + ", ".join(details) + ")")
+        self.artifact_id = artifact_id
+        self.region = region
+        self.metadata_state = metadata_state
+        self.origin_region = origin_region
+        self.replication_age_seconds = replication_age_seconds
+
+
+class ArtifactConsistencyError(AgentOrchestratorError):
+    def __init__(
+        self,
+        artifact_id: str,
+        region: str,
+        expected_digest: str,
+        actual_digest: str,
+    ):
+        super().__init__(
+            "Artifact digest mismatch "
+            f"(artifact_id={artifact_id}, region={region}, "
+            f"expected_digest={expected_digest}, "
+            f"actual_digest={actual_digest})"
+        )
+        self.artifact_id = artifact_id
+        self.region = region
+        self.expected_digest = expected_digest
+        self.actual_digest = actual_digest
 
 # 2019-01-25T13:21:06 update
 
