@@ -2,13 +2,125 @@
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from src.agent.registry import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
+
+
+class RunState(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_RUN_STATES = {
+    RunState.COMPLETED,
+    RunState.FAILED,
+    RunState.CANCELLED,
+}
+
+
+class RunHeartbeatMonitor:
+    def __init__(self):
+        self._states: Dict[str, RunState] = {}
+        self._heartbeats: Dict[str, Dict[str, Any]] = {}
+        self._decisions: List[Dict[str, Any]] = []
+
+    def begin(self, run_id: str) -> bool:
+        return self._transition(run_id, RunState.RUNNING, source="begin")
+
+    def complete(self, run_id: str) -> bool:
+        return self._transition(run_id, RunState.COMPLETED, source="complete")
+
+    def fail(self, run_id: str) -> bool:
+        return self._transition(run_id, RunState.FAILED, source="fail")
+
+    def cancel(self, run_id: str) -> bool:
+        return self._transition(run_id, RunState.CANCELLED, source="cancel")
+
+    def record_heartbeat(
+        self,
+        run_id: str,
+        worker_id: str,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        current = self._states.get(run_id, RunState.PENDING)
+        if current in TERMINAL_RUN_STATES:
+            self._record_decision(
+                run_id,
+                "heartbeat_rejected_terminal",
+                current,
+                worker_id=worker_id,
+            )
+            return False
+
+        self._states[run_id] = RunState.RUNNING
+        self._heartbeats[run_id] = {
+            "worker_id": worker_id,
+            "timestamp": timestamp if timestamp is not None else time.time(),
+        }
+        self._record_decision(
+            run_id,
+            "heartbeat_accepted",
+            RunState.RUNNING,
+            worker_id=worker_id,
+        )
+        return True
+
+    def state(self, run_id: str) -> RunState:
+        return self._states.get(run_id, RunState.PENDING)
+
+    def last_heartbeat(self, run_id: str) -> Optional[Dict[str, Any]]:
+        heartbeat = self._heartbeats.get(run_id)
+        return dict(heartbeat) if heartbeat else None
+
+    def decisions(self) -> List[Dict[str, Any]]:
+        return list(self._decisions)
+
+    def _transition(
+        self,
+        run_id: str,
+        next_state: RunState,
+        *,
+        source: str,
+    ) -> bool:
+        current = self._states.get(run_id, RunState.PENDING)
+        if current in TERMINAL_RUN_STATES:
+            self._record_decision(
+                run_id,
+                f"{source}_rejected_terminal",
+                current,
+            )
+            return current == next_state
+
+        self._states[run_id] = next_state
+        self._record_decision(run_id, source, next_state)
+        return True
+
+    def _record_decision(
+        self,
+        run_id: str,
+        decision: str,
+        state: RunState,
+        *,
+        worker_id: Optional[str] = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "run_id": run_id,
+            "decision": decision,
+            "state": state.value,
+        }
+        if worker_id is not None:
+            entry["worker_id"] = worker_id
+        self._decisions.append(entry)
 
 
 class OrchestrationEngine:
@@ -18,6 +130,7 @@ class OrchestrationEngine:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
+        self.heartbeat_monitor = RunHeartbeatMonitor()
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -56,10 +169,12 @@ class OrchestrationEngine:
                 raise ValueError(f"Agent {agent_id} not found")
 
             self.registry.update_status(agent_id, AgentStatus.RUNNING)
+            self.heartbeat_monitor.begin(task_id)
             result = await asyncio.wait_for(
                 self._run_agent_task(agent, task),
                 timeout=self.agent_timeout,
             )
+            self.heartbeat_monitor.complete(task_id)
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
             for hook in self._hooks["post_execute"]:
@@ -68,6 +183,7 @@ class OrchestrationEngine:
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
+            self.heartbeat_monitor.fail(task_id)
             logger.error(f"Task {task_id} failed: {e}")
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
@@ -82,7 +198,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
