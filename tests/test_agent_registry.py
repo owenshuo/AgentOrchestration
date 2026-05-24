@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +46,66 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_resolve_returns_safe_lookup_snapshot(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"token": "secret-token"},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        resolved = self.registry.resolve(agent_id, required_type="worker.processor")
+        assert resolved["id"] == agent_id
+        assert resolved["status"] == "running"
+        assert "config" not in resolved
+
+        resolved["status"] = "terminated"
+        cached = self.registry.resolve(agent_id, required_type="worker.processor")
+        assert cached["status"] == "running"
+
+    def test_disabled_agent_invalidates_cached_resolution(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve(agent_id) is not None
+
+        assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
+
+        assert self.registry.resolve(agent_id) is None
+        assert not self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.get(agent_id)["status"] == "stopped"
+
+        records = self.registry.audit_records()
+        cache_invalidated = any(
+            record["event"] == "registry_cache_invalidated"
+            and record["reason"] == "status_changed"
+            for record in records
+        )
+        assert cache_invalidated
+        assert records[-1]["event"] == "registry_transition_rejected"
+        assert "config" not in records[-1]
+
+    def test_delete_invalidates_cached_resolution(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve(agent_id) is not None
+
+        assert self.registry.delete(agent_id)
+
+        assert self.registry.resolve(agent_id) is None
+        records = self.registry.audit_records()
+        assert records[-1]["event"] == "registry_cache_invalidated"
+        assert records[-1]["reason"] == "agent_deleted"
+
+    def test_resolve_rejects_required_type_mismatch(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert self.registry.resolve(agent_id, required_type="monitor.watcher") is None
+
+        records = self.registry.audit_records()
+        assert records[-1]["event"] == "registry_lookup_rejected"
+        assert records[-1]["reason"] == "type_mismatch"
 
 # 2019-01-23T10:28:57 update
 

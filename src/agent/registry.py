@@ -1,6 +1,5 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
@@ -17,12 +16,25 @@ class AgentStatus(Enum):
 
 
 class AgentRegistry:
+    _DISABLED_STATUSES = {
+        AgentStatus.STOPPED.value,
+        AgentStatus.FAILED.value,
+        AgentStatus.TERMINATED.value,
+    }
+
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._lookup_cache: Dict[str, Dict[str, Any]] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -45,7 +57,35 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def resolve(
+        self,
+        agent_id: str,
+        required_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        cache_key = self._cache_key(agent_id, required_type)
+        cached = self._lookup_cache.get(cache_key)
+        live_agent = self._agents.get(agent_id)
+
+        if not live_agent:
+            self._invalidate_lookup_cache(agent_id, "agent_missing")
+            return None
+
+        if not self._can_resolve(live_agent, required_type):
+            self._invalidate_lookup_cache(agent_id, "agent_unavailable")
+            return None
+
+        if cached:
+            return dict(cached)
+
+        snapshot = self._snapshot_for_lookup(live_agent)
+        self._lookup_cache[cache_key] = snapshot
+        return dict(snapshot)
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -57,6 +97,22 @@ class AgentRegistry:
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
+
+        current_status = self._agents[agent_id]["status"]
+        disabled_agent_reactivation = (
+            current_status in self._DISABLED_STATUSES
+            and status.value not in self._DISABLED_STATUSES
+        )
+        if disabled_agent_reactivation:
+            self._record_decision(
+                "registry_transition_rejected",
+                agent_id,
+                "agent_disabled",
+            )
+            return False
+
+        if current_status != status.value:
+            self._invalidate_lookup_cache(agent_id, "status_changed")
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
         return True
@@ -68,10 +124,84 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_lookup_cache(agent_id, "agent_deleted")
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._audit_records]
+
+    def _can_resolve(
+        self,
+        agent: Dict[str, Any],
+        required_type: Optional[str],
+    ) -> bool:
+        agent_id = agent.get("id", "")
+        if agent.get("status") in self._DISABLED_STATUSES:
+            self._record_decision(
+                "registry_lookup_rejected",
+                agent_id,
+                "agent_disabled",
+            )
+            return False
+        if required_type and agent.get("type") != required_type:
+            self._record_decision(
+                "registry_lookup_rejected",
+                agent_id,
+                "type_mismatch",
+            )
+            return False
+        return True
+
+    def _snapshot_for_lookup(self, agent: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": agent["id"],
+            "name": agent["name"],
+            "type": agent["type"],
+            "status": agent["status"],
+            "version": agent["version"],
+            "created_at": agent["created_at"],
+            "updated_at": agent["updated_at"],
+        }
+
+    def _invalidate_lookup_cache(self, agent_id: str, reason: str) -> None:
+        cache_prefix = f"{agent_id}::"
+        keys = [
+            key
+            for key in self._lookup_cache
+            if key == agent_id or key.startswith(cache_prefix)
+        ]
+        for key in keys:
+            self._lookup_cache.pop(key, None)
+        if keys:
+            self._record_decision(
+                "registry_cache_invalidated",
+                agent_id,
+                reason,
+                entries_removed=len(keys),
+            )
+
+    def _cache_key(self, agent_id: str, required_type: Optional[str]) -> str:
+        return f"{agent_id}::{required_type or ''}"
+
+    def _record_decision(
+        self,
+        event: str,
+        agent_id: str,
+        reason: str,
+        entries_removed: Optional[int] = None,
+    ) -> None:
+        record: Dict[str, Any] = {
+            "event": event,
+            "agent_id": agent_id,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if entries_removed is not None:
+            record["entries_removed"] = entries_removed
+        self._audit_records.append(record)
 
 # 2019-01-29T11:24:49 update
 
