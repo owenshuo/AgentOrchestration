@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
-    def __init__(self, agent_id: str, name: str, config: Optional[Dict] = None):
+    def __init__(
+        self, agent_id: str, name: str, config: Optional[Dict] = None
+    ):
         self.agent_id = agent_id
         self.name = name
         self.config = config or {}
@@ -30,9 +32,9 @@ class BaseAgent(ABC):
 
     async def run(self) -> None:
         self._running = True
-        await self.setup()
-        logger.info(f"Agent {self.name} ({self.agent_id}) started")
         try:
+            await self.setup()
+            logger.info(f"Agent {self.name} ({self.agent_id}) started")
             while self._running:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
