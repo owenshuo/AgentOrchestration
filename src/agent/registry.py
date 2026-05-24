@@ -1,10 +1,31 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+ALLOWED_REGISTRY_CONFIG_FIELDS = {
+    "description",
+    "enabled",
+    "endpoint",
+    "environment",
+    "handler",
+    "labels",
+    "max_concurrency",
+    "metadata",
+    "policy",
+    "priority",
+    "queue",
+    "retries",
+    "timeout",
+    "version",
+}
+DISABLED_STATUSES = {
+    "stopped",
+    "failed",
+    "terminated",
+}
 
 
 class AgentStatus(Enum):
@@ -16,13 +37,25 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class RegistryConfigError(ValueError):
+    """Raised when registry config contains unsupported fields."""
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[str, Dict[str, Any]] = {}
+        self._audit_log: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        safe_config = self._validate_config(config or {}, action="register")
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,7 +63,7 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": safe_config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,12 +73,46 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate(agent_id)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def resolve(
+        self,
+        agent_id: str,
+        required_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if agent_id in self._resolution_cache:
+            self._record_decision("resolve", agent_id, "cache_hit")
+            return self._resolution_cache[agent_id]
+
+        agent = self._agents.get(agent_id)
+        if not agent:
+            self._record_decision("resolve", agent_id, "missing")
+            return None
+
+        config = agent.get("config", {})
+        if agent["status"] in DISABLED_STATUSES:
+            self._record_decision("resolve", agent_id, "disabled_status")
+            return None
+        if config.get("enabled") is False:
+            self._record_decision("resolve", agent_id, "config_disabled")
+            return None
+        if required_type and agent["type"] != required_type:
+            self._record_decision("resolve", agent_id, "type_mismatch")
+            return None
+
+        self._resolution_cache[agent_id] = agent
+        self._record_decision("resolve", agent_id, "accepted")
+        return agent
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,6 +126,18 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate(agent_id)
+        self._record_decision("status", agent_id, f"set_{status.value}")
+        return True
+
+    def update_config(self, agent_id: str, config: Dict[str, Any]) -> bool:
+        if agent_id not in self._agents:
+            return False
+        safe_config = self._validate_config(config, action="update_config")
+        self._agents[agent_id]["config"] = safe_config
+        self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate(agent_id)
+        self._record_decision("config", agent_id, "updated")
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +147,61 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate(agent_id)
+        self._record_decision("delete", agent_id, "deleted")
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_log(self) -> List[Dict[str, Any]]:
+        return list(self._audit_log)
+
+    def _validate_config(
+        self,
+        config: Dict[str, Any],
+        *,
+        action: str,
+    ) -> Dict[str, Any]:
+        if not isinstance(config, dict):
+            self._record_decision(action, None, "rejected_invalid_config")
+            raise RegistryConfigError("registry config must be a dictionary")
+
+        unknown_fields = sorted(
+            set(config) - ALLOWED_REGISTRY_CONFIG_FIELDS
+        )
+        if unknown_fields:
+            self._record_decision(
+                action,
+                None,
+                "rejected_unknown_fields",
+                fields=unknown_fields,
+            )
+            raise RegistryConfigError(
+                "unknown registry config fields: "
+                + ", ".join(unknown_fields)
+            )
+        return dict(config)
+
+    def _invalidate(self, agent_id: str) -> None:
+        self._resolution_cache.pop(agent_id, None)
+
+    def _record_decision(
+        self,
+        action: str,
+        agent_id: Optional[str],
+        decision: str,
+        *,
+        fields: Optional[List[str]] = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "action": action,
+            "agent_id": agent_id,
+            "decision": decision,
+        }
+        if fields:
+            entry["fields"] = list(fields)
+        self._audit_log.append(entry)
 
 # 2019-01-29T11:24:49 update
 

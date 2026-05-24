@@ -1,5 +1,9 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import (
+    AgentRegistry,
+    AgentStatus,
+    RegistryConfigError,
+)
 
 
 class TestAgentRegistry:
@@ -47,6 +51,104 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_register_accepts_known_config_fields(self):
+        config = {
+            "enabled": True,
+            "timeout": 30,
+            "retries": 2,
+            "endpoint": "worker.local",
+            "metadata": {"owner": "team-a"},
+        }
+
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config,
+        )
+
+        assert self.registry.get(agent_id)["config"] == config
+
+    def test_register_rejects_non_dict_config(self):
+        with pytest.raises(RegistryConfigError) as error:
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                ["enabled"],
+            )
+
+        assert str(error.value) == "registry config must be a dictionary"
+        assert self.registry.count() == 0
+        assert self.registry.audit_log()[-1] == {
+            "action": "register",
+            "agent_id": None,
+            "decision": "rejected_invalid_config",
+        }
+
+    def test_register_rejects_unknown_config_fields(self):
+        with pytest.raises(RegistryConfigError) as error:
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                {"enabled": True, "stale_policy": "secret-policy"},
+            )
+
+        assert "stale_policy" in str(error.value)
+        assert self.registry.count() == 0
+        assert self.registry.audit_log()[-1] == {
+            "action": "register",
+            "agent_id": None,
+            "decision": "rejected_unknown_fields",
+            "fields": ["stale_policy"],
+        }
+
+    def test_update_config_preserves_lifecycle_on_invalid_drift(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"enabled": True, "queue": "critical"},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        with pytest.raises(RegistryConfigError):
+            self.registry.update_config(
+                agent_id,
+                {"enabled": False, "unexpected_handler": "private"},
+            )
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert agent["config"] == {"enabled": True, "queue": "critical"}
+        assert self.registry.resolve(agent_id)["id"] == agent_id
+
+    def test_resolve_rejects_disabled_config_and_invalidates_cache(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"enabled": True},
+        )
+        assert self.registry.resolve(agent_id)["id"] == agent_id
+
+        assert self.registry.update_config(agent_id, {"enabled": False})
+
+        assert self.registry.resolve(agent_id) is None
+        assert self.registry.audit_log()[-1] == {
+            "action": "resolve",
+            "agent_id": agent_id,
+            "decision": "config_disabled",
+        }
+
+    def test_resolve_rejects_required_type_mismatch(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        assert (
+            self.registry.resolve(agent_id, required_type="monitor.watcher")
+            is None
+        )
+        assert (
+            self.registry.resolve(agent_id, required_type="worker.processor")
+            is not None
+        )
 
 # 2019-01-23T10:28:57 update
 
