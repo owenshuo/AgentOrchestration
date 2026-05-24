@@ -5,6 +5,8 @@ import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
+from src.common.exception_tracking import build_exception_event
+
 
 class AgentExecutor:
     def __init__(self, max_concurrent: int = 5):
@@ -24,7 +26,15 @@ class AgentExecutor:
                 result = await task_obj
                 self._results[execution_id] = result
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                exception_event = build_exception_event(
+                    e,
+                    task=task,
+                    context={"agent_id": agent_id, "execution_id": execution_id},
+                )
+                self._results[execution_id] = {
+                    "error": exception_event["error_class"],
+                    "exception": exception_event,
+                }
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id

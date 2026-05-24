@@ -4,7 +4,12 @@ import json
 import logging
 import sys
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
+
+from src.common.exception_tracking import (
+    build_exception_event,
+    sanitize_exception_context,
+)
 
 
 class StructuredFormatter(logging.Formatter):
@@ -17,8 +22,10 @@ class StructuredFormatter(logging.Formatter):
         }
         if hasattr(record, "request_id"):
             log_entry["request_id"] = record.request_id
-        if record.exc_info and record.exc_info[0]:
-            log_entry["exception"] = self.formatException(record.exc_info)
+        if hasattr(record, "exception_context"):
+            log_entry["exception"] = sanitize_exception_context(record.exception_context)
+        elif record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = build_exception_event(record.exc_info[1])
         return json.dumps(log_entry)
 
 
