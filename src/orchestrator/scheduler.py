@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import random
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
 
@@ -31,55 +31,158 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        base_retry_delay: float = 1.0,
+        max_retry_delay: float = 60.0,
+        jitter_ratio: float = 0.25,
+        clock: Callable[[], float] = time.time,
+        random_fn: Callable[[], float] = random.random,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._terminal: Dict[str, str] = {}
+        self._max_retries = max_retries
+        self._base_retry_delay = base_retry_delay
+        self._max_retry_delay = max_retry_delay
+        self._jitter_ratio = jitter_ratio
+        self._clock = clock
+        self._random_fn = random_fn
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._clock()
         task["retries"] = 0
-
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        task["queue"] = queue
+        task["priority"] = priority
+        self._push_existing(task, queue, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": self._clock() + max(0.0, delay),
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            tid
+            for tid, scheduled in self._scheduled.items()
+            if scheduled["queue"] == queue and scheduled["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            self._push_existing(
+                scheduled["task"],
+                scheduled["queue"],
+                scheduled["priority"],
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
-            if task:
+            if task and task["id"] not in self._terminal:
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
-
-    def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+        scheduled = self._scheduled.pop(task_id, None)
+        if task is None and scheduled is None:
+            return False
+        self._terminal[task_id] = "completed"
+        return True
+
+    def cancel(self, task_id: str) -> bool:
+        task = self._in_flight.pop(task_id, None)
+        scheduled = self._scheduled.pop(task_id, None)
+        if task is None and scheduled is None:
+            return False
+        self._terminal[task_id] = "cancelled"
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        transient: bool = True,
+    ) -> bool:
+        if task_id in self._terminal:
+            return False
+
+        task = self._in_flight.pop(task_id, None)
+        if not task:
+            return False
+
+        task["retries"] += 1
+        if transient and task["retries"] < self._max_retries:
+            delay = self._retry_delay(task["retries"])
+            retry_queue = task.get("queue", queue)
+            retry_priority = task.get("priority", 0)
+            task["retry_after"] = self._clock() + delay
+            self.schedule(task, delay, retry_queue, retry_priority)
+            return True
+
+        self._terminal[task_id] = "failed"
         return False
+
+    def retry_state(self, task_id: str) -> Optional[Dict[str, Any]]:
+        scheduled = self._scheduled.get(task_id)
+        if not scheduled:
+            return None
+        return {
+            "run_at": scheduled["run_at"],
+            "queue": scheduled["queue"],
+            "priority": scheduled["priority"],
+            "retries": scheduled["task"].get("retries", 0),
+        }
+
+    def terminal_state(self, task_id: str) -> Optional[str]:
+        return self._terminal.get(task_id)
+
+    def _retry_delay(self, retry_count: int) -> float:
+        retry_index = max(0, retry_count - 1)
+        delay = self._base_retry_delay * (2 ** retry_index)
+        capped_delay = min(delay, self._max_retry_delay)
+        jitter = capped_delay * self._jitter_ratio * self._random_fn()
+        return capped_delay + jitter
+
+    def _push_existing(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> None:
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
 
 # 2019-04-25T08:37:12 update
 
