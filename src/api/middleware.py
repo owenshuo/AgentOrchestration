@@ -1,18 +1,118 @@
 """API middleware components."""
 
-import time
 import logging
-from typing import Callable
+import os
+import time
+from typing import Callable, Optional
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+_TRUE_VALUES = {"1", "true", "yes", "on", "production"}
+_FALSE_VALUES = {"0", "false", "no", "off", "development", "test"}
+_SECURITY_STATE_KEY = "ao_security_decision"
+
+
+def _env_flag(*names: str, default: bool = False) -> bool:
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        normalized = value.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    return default
+
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Fail closed on insecure proxy scheme before handlers run."""
+
+    def __init__(self, app, require_https_proxy: Optional[bool] = None):
+        super().__init__(app)
+        self.require_https_proxy = (
+            require_https_proxy
+            if require_https_proxy is not None
+            else _env_flag(
+                "AO_REQUIRE_HTTPS_PROXY",
+                "REQUIRE_HTTPS_PROXY",
+                "AO_PRODUCTION_PROXY_MODE",
+                "PRODUCTION_PROXY_MODE",
+            )
+        )
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        request.state.ao_security_decision = "allowed"
+        try:
+            should_reject = (
+                self.require_https_proxy
+                and not _is_https_proxy_request(request)
+            )
+            if should_reject:
+                request.state.ao_security_decision = "rejected"
+                logger.warning(
+                    "Rejected request with insecure proxy scheme",
+                    extra={"path": request.url.path},
+                )
+                return Response(
+                    status_code=400,
+                    content="HTTPS required",
+                    headers={"X-AO-Security-Decision": "rejected"},
+                )
+
+            response = await call_next(request)
+            response.headers["X-AO-Security-Decision"] = "allowed"
+            return response
+        finally:
+            _clear_security_state(request)
+
+
+def _is_https_proxy_request(request: Request) -> bool:
+    forwarded_proto = _get_forwarded_proto(request.headers.get("forwarded"))
+    if forwarded_proto:
+        return forwarded_proto == "https"
+
+    forwarded_scheme = request.headers.get("x-forwarded-proto", "")
+    if forwarded_scheme:
+        first_scheme = forwarded_scheme.split(",", 1)[0].strip().lower()
+        return first_scheme == "https"
+
+    return request.url.scheme == "https"
+
+
+def _get_forwarded_proto(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+
+    first_entry = header_value.split(",", 1)[0]
+    for part in first_entry.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key.lower() == "proto":
+            return value.strip('"').lower()
+    return None
+
+
+def _clear_security_state(request: Request) -> None:
+    request.state._state.pop(_SECURITY_STATE_KEY, None)
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_api_request = request.url.path.startswith("/api/v2")
+        is_token_request = request.url.path == "/api/v2/auth/token"
+        if is_api_request and not is_token_request:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +126,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +149,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
