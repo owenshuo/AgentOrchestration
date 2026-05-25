@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,65 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_worker_disconnect_reclaims_reserved_job_once(self):
+        self.scheduler.enqueue({"type": "reserved"}, priority=7)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        original_task_id = task["id"]
+
+        reclaimed = self.scheduler.reclaim_worker_reservations(
+            "worker-a",
+            idempotency_key="worker-a:disconnect-1",
+        )
+        duplicate = self.scheduler.reclaim_worker_reservations(
+            "worker-a",
+            idempotency_key="worker-a:disconnect-1",
+        )
+        retry = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+
+        assert reclaimed == [original_task_id]
+        assert duplicate == []
+        assert retry["reservation_state"] == (
+            "reclaimed_after_worker_disconnect"
+        )
+        assert retry["retries"] == 1
+        assert self.scheduler._in_flight[retry["id"]] is retry
+        assert original_task_id not in self.scheduler._in_flight
+        assert self.scheduler.reservation_audit == [
+            {
+                "worker_id": "worker-a",
+                "decision": "reclaimed",
+                "idempotency_key": "worker-a:disconnect-1",
+                "task_ids": [original_task_id],
+            },
+            {
+                "worker_id": "worker-a",
+                "decision": "duplicate_reclaim_ignored",
+                "idempotency_key": "worker-a:disconnect-1",
+            },
+        ]
+
+    def test_worker_disconnect_preserves_other_worker_lifecycle_state(self):
+        self.scheduler.enqueue({"type": "a"})
+        self.scheduler.enqueue({"type": "b"})
+
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        second = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+        first_task_id = first["id"]
+
+        reclaimed = self.scheduler.reclaim_worker_reservations(
+            "worker-a",
+            idempotency_key="worker-a:disconnect-2",
+        )
+
+        assert reclaimed == [first_task_id]
+        assert second["id"] in self.scheduler._in_flight
+        assert self.scheduler._reservations[second["id"]]["worker_id"] == (
+            "worker-b"
+        )
 
 # 2019-01-09T19:07:03 update
 

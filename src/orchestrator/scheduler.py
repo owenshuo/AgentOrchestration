@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -35,26 +34,49 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._reservations: Dict[str, Dict[str, Any]] = {}
+        self._disconnect_idempotency: Set[str] = set()
+        self.reservation_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
+        task["queue"] = queue
+        task["priority"] = priority
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        worker_id: str = "default-worker",
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -66,13 +88,21 @@ class TaskScheduler:
             task = self._queues[queue].pop()
             if task:
                 self._in_flight[task["id"]] = task
+                self._reservations[task["id"]] = {
+                    "worker_id": worker_id,
+                    "queue": queue,
+                    "priority": task.get("priority", 0),
+                    "reserved_at": now,
+                }
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
+        self._reservations.pop(task_id, None)
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
+        self._reservations.pop(task_id, None)
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
@@ -80,6 +110,52 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def reclaim_worker_reservations(
+        self,
+        worker_id: str,
+        idempotency_key: str,
+    ) -> List[str]:
+        if idempotency_key in self._disconnect_idempotency:
+            self.reservation_audit.append(
+                {
+                    "worker_id": worker_id,
+                    "decision": "duplicate_reclaim_ignored",
+                    "idempotency_key": idempotency_key,
+                }
+            )
+            return []
+
+        self._disconnect_idempotency.add(idempotency_key)
+        reclaimed: List[str] = []
+        for task_id, reservation in list(self._reservations.items()):
+            if reservation["worker_id"] != worker_id:
+                continue
+
+            task = self._in_flight.pop(task_id, None)
+            self._reservations.pop(task_id, None)
+            if not task:
+                continue
+
+            task["reservation_state"] = "reclaimed_after_worker_disconnect"
+            task["retries"] += 1
+            if task["retries"] < self._max_retries:
+                self.enqueue(
+                    task,
+                    queue=reservation["queue"],
+                    priority=reservation["priority"],
+                )
+            reclaimed.append(task_id)
+
+        self.reservation_audit.append(
+            {
+                "worker_id": worker_id,
+                "decision": "reclaimed",
+                "idempotency_key": idempotency_key,
+                "task_ids": reclaimed,
+            }
+        )
+        return reclaimed
 
 # 2019-04-25T08:37:12 update
 
