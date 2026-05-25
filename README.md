@@ -47,6 +47,25 @@ ao deploy examples/hello-agent.yaml
 ao status --watch
 ```
 
+
+## Release Provenance
+
+Tagged releases build the Python package archives in the trusted GitHub Actions
+release workflow. Each file in `dist/*` is covered by a GitHub artifact
+attestation that records the source repository, commit, workflow identity,
+build environment, and artifact digest before the archives are uploaded as
+workflow artifacts or release assets.
+
+After downloading a release archive, verify its provenance with:
+
+```bash
+gh attestation verify agent_orchestrator-*.tar.gz --repo orchestration-agent/AgentOrchestration
+gh attestation verify agent_orchestrator-*.whl --repo orchestration-agent/AgentOrchestration
+```
+
+The verification must resolve to the tagged source revision and the `Release`
+workflow before the package is trusted.
+
 ## Documentation
 
 Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrator.io)
