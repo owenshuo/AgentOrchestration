@@ -47,6 +47,19 @@ ao deploy examples/hello-agent.yaml
 ao status --watch
 ```
 
+
+## Local Docker Stack
+
+The Docker Compose stack lives in `infra/docker-compose.yml`. Default API and
+worker services do not mount the host Docker socket. Container build tasks must
+opt in to the isolated builder profile so socket access is explicit:
+
+```bash
+docker compose -f infra/docker-compose.yml --profile builder up -d builder
+```
+
+See `infra/README.md` for the builder profile security boundary.
+
 ## Documentation
 
 Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrator.io)

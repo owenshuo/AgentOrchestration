@@ -1,0 +1,36 @@
+services:
+  api:
+    image: agent-orchestrator-api:${AO_IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: infra/images/api.Dockerfile
+    command: uvicorn src.api.server:create_app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      AO_WORKER_ENDPOINT: http://worker:9000
+
+  worker:
+    image: agent-orchestrator-worker:${AO_IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: infra/images/worker.Dockerfile
+    command: python -m src.agent.executor
+    environment:
+      AO_BUILDER_ENDPOINT: http://builder:2375
+    depends_on:
+      - api
+
+  builder:
+    image: docker:27-cli
+    profiles:
+      - builder
+    command: ["sh", "-c", "sleep infinity"]
+    read_only: true
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+    security_opt:
+      - no-new-privileges:true
