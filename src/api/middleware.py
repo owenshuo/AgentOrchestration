@@ -1,21 +1,68 @@
 """API middleware components."""
 
-import time
 import logging
+import time
 from typing import Callable
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+DOCUMENTATION_PATHS = {"/openapi.json", "/api/docs", "/api/redoc"}
+DOCUMENTATION_ROLES = {"admin", "owner"}
+REVOKED_TOKENS = {"revoked", "stale"}
+
+
+def _bearer_token(request: Request) -> str:
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        return ""
+    return authorization.removeprefix("Bearer ").strip()
+
+
+def _has_fresh_token(request: Request) -> bool:
+    token = _bearer_token(request)
+    return bool(token) and token.lower() not in REVOKED_TOKENS
+
+
+def _has_workspace_context(request: Request) -> bool:
+    return bool(request.headers.get("X-Workspace-ID", "").strip())
+
+
+def _has_documentation_role(request: Request) -> bool:
+    role = request.headers.get("X-Active-Role", "").strip().lower()
+    return role in DOCUMENTATION_ROLES
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if request.url.path in DOCUMENTATION_PATHS:
+            if not _has_fresh_token(request):
                 return Response(status_code=401, content="Unauthorized")
+            if not _has_workspace_context(request):
+                return Response(
+                    status_code=403,
+                    content="Workspace context required",
+                )
+            if not _has_documentation_role(request):
+                return Response(
+                    status_code=403,
+                    content="Documentation role required",
+                )
+
+        protected_api = (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        )
+        if protected_api and not _has_fresh_token(request):
+            return Response(status_code=401, content="Unauthorized")
+
         return await call_next(request)
 
 
@@ -26,14 +73,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +97,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
