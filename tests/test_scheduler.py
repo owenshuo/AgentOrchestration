@@ -1,5 +1,9 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import (
+    MaintenanceMigrationError,
+    QueueIntakePausedError,
+    TaskScheduler,
+)
 
 
 class TestTaskScheduler:
@@ -35,6 +39,47 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_pause_intake_blocks_new_tasks_but_allows_drain(self):
+        self.scheduler.enqueue({"type": "before-maintenance"})
+        health = self.scheduler.pause_intake("schema change")
+
+        assert health["intake_paused"]
+        assert health["queued_tasks"] == 1
+        with pytest.raises(QueueIntakePausedError):
+            self.scheduler.enqueue({"type": "during-maintenance"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["type"] == "before-maintenance"
+        assert self.scheduler.complete(task["id"])
+
+    def test_successful_maintenance_resumes_intake(self):
+        calls = []
+
+        result = self.scheduler.run_maintenance(
+            lambda: calls.append("migrated") or "done",
+            reason="add column",
+        )
+
+        assert result == "done"
+        assert calls == ["migrated"]
+        assert not self.scheduler.maintenance_health()["intake_paused"]
+        assert self.scheduler.enqueue({"type": "after-maintenance"})
+
+    def test_failed_maintenance_keeps_intake_paused_with_operator_alert(self):
+        def migration():
+            raise ValueError("migration failed")
+
+        with pytest.raises(MaintenanceMigrationError):
+            self.scheduler.run_maintenance(migration, reason="rename column")
+
+        health = self.scheduler.maintenance_health()
+        assert health["intake_paused"]
+        alert = health["operator_alerts"][-1]
+        assert alert["event"] == "maintenance_migration_failed"
+        with pytest.raises(QueueIntakePausedError):
+            self.scheduler.enqueue({"type": "after-failure"})
 
 # 2019-01-09T19:07:03 update
 

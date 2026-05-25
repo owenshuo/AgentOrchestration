@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -30,14 +29,28 @@ class PriorityQueue:
         return len(self._queue)
 
 
+class QueueIntakePausedError(RuntimeError):
+    """Raised when a caller attempts to add work during maintenance."""
+
+
+class MaintenanceMigrationError(RuntimeError):
+    """Raised when a paused maintenance migration fails."""
+
+
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._intake_paused = False
+        self._pause_reason: Optional[str] = None
+        self._operator_alerts: List[Dict[str, Any]] = []
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
+        self._ensure_intake_open("enqueue", queue)
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +61,67 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        self._ensure_intake_open("schedule", queue)
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def pause_intake(self, reason: str = "maintenance") -> Dict[str, Any]:
+        self._intake_paused = True
+        self._pause_reason = reason
+        return self.maintenance_health()
+
+    def resume_intake(self) -> Dict[str, Any]:
+        self._intake_paused = False
+        self._pause_reason = None
+        return self.maintenance_health()
+
+    def maintenance_health(self) -> Dict[str, Any]:
+        return {
+            "intake_paused": self._intake_paused,
+            "reason": self._pause_reason,
+            "queued_tasks": sum(len(queue) for queue in self._queues.values()),
+            "leased_tasks": len(self._in_flight),
+            "scheduled_tasks": len(self._scheduled),
+            "drain_policy": "existing queued and leased tasks may complete",
+            "operator_alerts": list(self._operator_alerts),
+        }
+
+    def run_maintenance(
+        self,
+        migration: Callable[[], Any],
+        reason: str = "schema migration",
+    ) -> Any:
+        self.pause_intake(reason)
+        try:
+            result = migration()
+        except Exception as error:
+            self._operator_alerts.append(
+                {
+                    "event": "maintenance_migration_failed",
+                    "reason": reason,
+                    "message": str(error),
+                    "intake_paused": True,
+                }
+            )
+            raise MaintenanceMigrationError(
+                "Maintenance migration failed; queue intake remains paused"
+            ) from error
+
+        self.resume_intake()
+        return result
+
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -80,6 +147,13 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _ensure_intake_open(self, operation: str, queue: str) -> None:
+        if self._intake_paused:
+            raise QueueIntakePausedError(
+                f"Queue intake is paused for {self._pause_reason}; "
+                f"cannot {operation} task on {queue}"
+            )
 
 # 2019-04-25T08:37:12 update
 
