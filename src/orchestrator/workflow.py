@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -13,9 +16,23 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowValidationError(ValueError):
+    """Raised when policy injection leaves a workflow graph invalid."""
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
-        self.id = str(uuid4())
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        step_id: Optional[str] = None,
+        requires_guard: bool = True,
+        is_guard: bool = False,
+        protects_step_id: Optional[str] = None,
+    ):
+        self.id = step_id or str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
@@ -23,6 +40,9 @@ class WorkflowStep:
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.requires_guard = requires_guard
+        self.is_guard = is_guard
+        self.protects_step_id = protects_step_id
 
 
 class Workflow:
@@ -43,14 +63,119 @@ class Workflow:
         return self._step_map.get(step_id)
 
 
+def guard_handler() -> bool:
+    return True
+
+
+class WorkflowPolicyInjector:
+    """Injects automatic guard nodes and validates the resulting graph."""
+
+    def inject_guards(self, workflow: Workflow) -> Workflow:
+        injected_steps: List[WorkflowStep] = []
+        for step in workflow.steps:
+            if step.is_guard or not step.requires_guard:
+                injected_steps.append(step)
+                continue
+
+            guard = WorkflowStep(
+                name=f"policy_guard:{step.name}",
+                handler=guard_handler,
+                requires_guard=False,
+                is_guard=True,
+                protects_step_id=step.id,
+            )
+            injected_steps.extend([guard, step])
+
+        workflow.steps = injected_steps
+        workflow._step_map = {step.id: step for step in workflow.steps}
+        return workflow
+
+    def validate(self, workflow: Workflow) -> None:
+        seen: Set[str] = set()
+        guarded_step_ids: Set[str] = set()
+
+        for step in workflow.steps:
+            if step.id in seen:
+                raise WorkflowValidationError(
+                    f"duplicate workflow step id rejected: {step.id}"
+                )
+            seen.add(step.id)
+
+            if step.status is not StepStatus.PENDING:
+                raise WorkflowValidationError(
+                    f"stale workflow step rejected during policy injection: "
+                    f"{step.id}"
+                )
+
+            if step.is_guard:
+                if not step.protects_step_id:
+                    raise WorkflowValidationError(
+                        f"guard step {step.id} does not protect a step"
+                    )
+                guarded_step_ids.add(step.protects_step_id)
+
+        missing_guards = [
+            step.id
+            for step in workflow.steps
+            if step.requires_guard
+            and not step.is_guard
+            and step.id not in guarded_step_ids
+        ]
+        if missing_guards:
+            raise WorkflowValidationError(
+                "workflow policy guard missing for steps: "
+                f"{', '.join(sorted(missing_guards))}"
+            )
+
+    def inject_and_validate(self, workflow: Workflow) -> Workflow:
+        self.inject_guards(workflow)
+        self.validate(workflow)
+        return workflow
+
+
 class WorkflowManager:
-    def __init__(self):
+    def __init__(
+        self,
+        policy_injector: Optional[WorkflowPolicyInjector] = None,
+    ):
         self._workflows: Dict[str, Workflow] = {}
+        self.policy_injector = policy_injector or WorkflowPolicyInjector()
+        self.audit_records: List[Dict[str, str]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
-        self._workflows[workflow.id] = workflow
+        self.register_workflow(workflow)
         return workflow
+
+    def register_workflow(self, workflow: Workflow) -> Workflow:
+        previous = self._workflows.get(workflow.id)
+        try:
+            self.policy_injector.inject_and_validate(workflow)
+        except WorkflowValidationError as error:
+            self._record_audit(
+                workflow.id,
+                "policy_graph_rejected",
+                str(error),
+            )
+            if previous is None:
+                self._workflows.pop(workflow.id, None)
+            else:
+                self._workflows[workflow.id] = previous
+            raise
+
+        self._workflows[workflow.id] = workflow
+        self._record_audit(
+            workflow.id,
+            "policy_graph_accepted",
+            "automatic guard nodes validated",
+        )
+        return workflow
+
+    def _record_audit(self, workflow_id: str, event: str, reason: str) -> None:
+        self.audit_records.append(
+            {"workflow_id": workflow_id, "event": event, "reason": reason}
+        )
+        logger.info("workflow policy decision: %s", event)
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
         return self._workflows.get(workflow_id)
