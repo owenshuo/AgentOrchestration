@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 
@@ -13,30 +13,116 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowValidationError(ValueError):
+    """Raised when a workflow definition violates registration invariants."""
+
+
+def _parameter_aliases(parameter: Dict[str, Any]) -> Iterable[str]:
+    alias = parameter.get("alias")
+    if alias:
+        yield str(alias)
+
+    for alias_value in parameter.get("aliases", ()):
+        if alias_value:
+            yield str(alias_value)
+
+    name = parameter.get("name")
+    if name:
+        yield str(name)
+
+
+def _validate_unique_parameter_aliases(
+    parameters: Optional[List[Dict[str, Any]]],
+    audit: List[Dict[str, Any]],
+    scope: str,
+) -> None:
+    if not parameters:
+        audit.append(
+            {
+                "scope": scope,
+                "decision": "accepted",
+                "reason": "no_parameters",
+            }
+        )
+        return
+
+    seen: Dict[str, str] = {}
+    for parameter in parameters:
+        for raw_alias in _parameter_aliases(parameter):
+            alias = raw_alias.strip().casefold()
+            if not alias:
+                continue
+            if alias in seen:
+                audit.append(
+                    {
+                        "scope": scope,
+                        "decision": "rejected",
+                        "reason": "duplicate_parameter_alias",
+                        "alias": alias,
+                    }
+                )
+                raise WorkflowValidationError(
+                    "Duplicate workflow parameter alias "
+                    f"'{raw_alias}' in {scope}"
+                )
+            seen[alias] = raw_alias
+
+    audit.append(
+        {
+            "scope": scope,
+            "decision": "accepted",
+            "reason": "unique_parameter_aliases",
+        }
+    )
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        input_parameters: Optional[List[Dict[str, Any]]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.input_parameters = input_parameters or []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        input_parameters: Optional[List[Dict[str, Any]]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.input_parameters = input_parameters or []
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.validation_audit: List[Dict[str, Any]] = []
+        _validate_unique_parameter_aliases(
+            self.input_parameters, self.validation_audit, "workflow"
+        )
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        audit_entry: List[Dict[str, Any]] = []
+        _validate_unique_parameter_aliases(
+            step.input_parameters, audit_entry, f"step:{step.name}"
+        )
         self.steps.append(step)
         self._step_map[step.id] = step
+        self.validation_audit.extend(audit_entry)
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
@@ -47,8 +133,15 @@ class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        input_parameters: Optional[List[Dict[str, Any]]] = None,
+    ) -> Workflow:
+        workflow = Workflow(
+            name, description, input_parameters=input_parameters
+        )
         self._workflows[workflow.id] = workflow
         return workflow
 
