@@ -27,3 +27,18 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  image-metadata-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: |
+          docker build \
+            --build-arg AO_BUILD_CONFIG=build-only-sentinel-4088 \
+            -t agent-orchestrator:metadata-audit .
+      - name: Audit runtime image metadata
+        run: |
+          python3 scripts/audit_image_metadata.py \
+            agent-orchestrator:metadata-audit \
+            --forbidden-value build-only-sentinel-4088
