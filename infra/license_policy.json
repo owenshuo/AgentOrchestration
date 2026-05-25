@@ -1,0 +1,34 @@
+{
+  "allow_licenses": [
+    "Apache Software License",
+    "Apache-2.0",
+    "BSD License",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MIT License",
+    "Mozilla Public License 2.0 (MPL 2.0)",
+    "MPL-2.0",
+    "Python Software Foundation License"
+  ],
+  "prohibited_licenses": [
+    "AGPL-3.0",
+    "AGPL-3.0-only",
+    "GPL-3.0",
+    "GPL-3.0-only",
+    "LGPL-3.0",
+    "LGPL-3.0-only"
+  ],
+  "deny_unknown": false,
+  "exceptions": [
+    {
+      "ecosystem": "system",
+      "package": "debian-runtime-baseline",
+      "license": "UNKNOWN",
+      "owner": "platform-runtime",
+      "expires": "2027-01-01",
+      "reason": "Debian package metadata does not consistently expose SPDX license fields; runtime package reports still include these entries for audit review."
+    }
+  ]
+}

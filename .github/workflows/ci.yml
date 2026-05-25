@@ -27,3 +27,21 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  image-license-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: docker build -t agent-orchestrator:license-scan .
+      - name: Scan final image licenses
+        run: |
+          python3 scripts/scan_image_licenses.py \
+            agent-orchestrator:license-scan \
+            --policy infra/license_policy.json \
+            --output image-license-report.json
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-license-report
+          path: image-license-report.json
