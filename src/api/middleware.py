@@ -1,21 +1,73 @@
 """API middleware components."""
 
-import time
+import hashlib
 import logging
-from typing import Callable
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Callable, Optional
+from uuid import uuid4
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+_request_context: ContextVar[Optional["RequestContext"]] = ContextVar(
+    "request_context",
+    default=None,
+)
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    correlation_id: str
+    workspace_id: str
+    active_role: str
+
+
+def get_request_context() -> Optional[RequestContext]:
+    return _request_context.get()
+
+
+def _safe_header(value: Optional[str], fallback: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return fallback
+    return cleaned[:128]
+
+
+def _scoped_correlation_id(
+    raw_correlation_id: str,
+    workspace_id: str,
+    active_role: str,
+) -> str:
+    scope = f"{workspace_id}:{active_role}:{raw_correlation_id}"
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32]
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        protected = (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        )
+        if protected:
             token = request.headers.get("Authorization", "")
+            workspace_id = request.headers.get("X-Workspace-ID", "")
+            active_role = request.headers.get("X-Active-Role", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
+            if not workspace_id.strip() or not active_role.strip():
+                return Response(
+                    status_code=403,
+                    content="Workspace context required",
+                )
         return await call_next(request)
 
 
@@ -26,14 +78,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,12 +102,49 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
-        response = await call_next(request)
-        duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
-        return response
+        raw_correlation_id = _safe_header(
+            request.headers.get("X-Correlation-ID"),
+            str(uuid4()),
+        )
+        workspace_id = _safe_header(
+            request.headers.get("X-Workspace-ID"),
+            "public",
+        )
+        active_role = _safe_header(
+            request.headers.get("X-Active-Role"),
+            "anonymous",
+        )
+        scoped_correlation_id = _scoped_correlation_id(
+            raw_correlation_id,
+            workspace_id,
+            active_role,
+        )
+        context = RequestContext(
+            correlation_id=scoped_correlation_id,
+            workspace_id=workspace_id,
+            active_role=active_role,
+        )
+        token = _request_context.set(context)
+        try:
+            response = await call_next(request)
+            response.headers["X-Correlation-ID"] = scoped_correlation_id
+            return response
+        finally:
+            duration = time.time() - start
+            logger.info(
+                "%s %s %.3fs",
+                request.method,
+                request.url.path,
+                duration,
+                extra={"request_id": scoped_correlation_id},
+            )
+            _request_context.reset(token)
 
 # 2019-03-01T18:35:19 update
 
