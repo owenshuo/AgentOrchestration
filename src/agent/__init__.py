@@ -3,9 +3,15 @@
 from .registry import AgentRegistry
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
-from .sandbox import AgentSandbox
+from .sandbox import AgentSandbox, UnsupportedSandboxLimitError
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+__all__ = [
+    "AgentRegistry",
+    "AgentExecutor",
+    "AgentRuntime",
+    "AgentSandbox",
+    "UnsupportedSandboxLimitError",
+]
 
 # 2019-02-05T12:34:30 update
 
