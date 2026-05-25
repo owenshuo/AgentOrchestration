@@ -1,8 +1,8 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
+from uuid import UUID
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -16,13 +16,26 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class AgentIdentifierError(ValueError):
+    """Raised when an agent identifier is malformed."""
+
+
+def normalize_agent_id(agent_id: str) -> str:
+    try:
+        return str(UUID(str(agent_id).strip()))
+    except (TypeError, ValueError) as error:
+        raise AgentIdentifierError("Malformed agent identifier") from error
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self, name: str, agent_type: str, config: Optional[Dict] = None
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -43,9 +56,17 @@ class AgentRegistry:
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        return self._agents.get(agent_id)
+        try:
+            normalized_id = normalize_agent_id(agent_id)
+        except AgentIdentifierError:
+            return None
+        return self._agents.get(normalized_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -55,19 +76,27 @@ class AgentRegistry:
         return list(agents)
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
-        if agent_id not in self._agents:
+        try:
+            normalized_id = normalize_agent_id(agent_id)
+        except AgentIdentifierError:
             return False
-        self._agents[agent_id]["status"] = status.value
-        self._agents[agent_id]["updated_at"] = time.time()
+        if normalized_id not in self._agents:
+            return False
+        self._agents[normalized_id]["status"] = status.value
+        self._agents[normalized_id]["updated_at"] = time.time()
         return True
 
     def delete(self, agent_id: str) -> bool:
-        if agent_id not in self._agents:
+        try:
+            normalized_id = normalize_agent_id(agent_id)
+        except AgentIdentifierError:
             return False
-        agent = self._agents.pop(agent_id)
+        if normalized_id not in self._agents:
+            return False
+        agent = self._agents.pop(normalized_id)
         group = agent["type"].split(".")[0]
-        if group in self._index and agent_id in self._index[group]:
-            self._index[group].remove(agent_id)
+        if group in self._index and normalized_id in self._index[group]:
+            self._index[group].remove(normalized_id)
         return True
 
     def count(self) -> int:

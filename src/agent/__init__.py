@@ -1,11 +1,24 @@
 """Agent lifecycle management module."""
 
-from .registry import AgentRegistry
+from .registry import (
+    AgentIdentifierError,
+    AgentRegistry,
+    AgentStatus,
+    normalize_agent_id,
+)
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
 from .sandbox import AgentSandbox
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+__all__ = [
+    "AgentIdentifierError",
+    "AgentRegistry",
+    "AgentStatus",
+    "normalize_agent_id",
+    "AgentExecutor",
+    "AgentRuntime",
+    "AgentSandbox",
+]
 
 # 2019-02-05T12:34:30 update
 

@@ -1,29 +1,46 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from src.agent import (
+    AgentIdentifierError,
+    AgentRegistry,
+    AgentStatus,
+    normalize_agent_id,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None, group: Optional[str] = None
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str, agent_type: str, config: Optional[Dict] = None
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
 
+def normalize_route_agent_id(agent_id: str) -> str:
+    try:
+        return normalize_agent_id(agent_id)
+    except AgentIdentifierError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @router.get("/agents/{agent_id}")
 async def get_agent(agent_id: str):
-    agent = registry.get(agent_id)
+    normalized_id = normalize_route_agent_id(agent_id)
+    agent = registry.get(normalized_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
@@ -31,21 +48,27 @@ async def get_agent(agent_id: str):
 
 @router.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: str):
-    if not registry.delete(agent_id):
+    normalized_id = normalize_route_agent_id(agent_id)
+    deleted = registry.delete(normalized_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "deleted"}
 
 
 @router.post("/agents/{agent_id}/start")
 async def start_agent(agent_id: str):
-    if not registry.update_status(agent_id, AgentStatus.RUNNING):
+    normalized_id = normalize_route_agent_id(agent_id)
+    updated = registry.update_status(normalized_id, AgentStatus.RUNNING)
+    if not updated:
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "started"}
 
 
 @router.post("/agents/{agent_id}/stop")
 async def stop_agent(agent_id: str):
-    if not registry.update_status(agent_id, AgentStatus.PAUSED):
+    normalized_id = normalize_route_agent_id(agent_id)
+    updated = registry.update_status(normalized_id, AgentStatus.PAUSED)
+    if not updated:
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "stopped"}
 
