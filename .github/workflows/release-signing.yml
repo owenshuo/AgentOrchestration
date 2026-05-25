@@ -1,0 +1,78 @@
+name: Release Signing
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sign"
+        required: true
+
+concurrency:
+  group: release-signing-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  sign-artifacts:
+    name: Sign release artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: release-signing-${{ github.ref_name }}-sign-artifacts
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: release
+        run: |
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build artifact manifest
+        run: |
+          mkdir -p dist/signing
+          find dist -maxdepth 1 -type f | sort > dist/signing/artifacts.txt
+
+      - name: Sign artifacts
+        run: |
+          while IFS= read -r artifact; do
+            [ -n "$artifact" ] || continue
+            sha256sum "$artifact" > "$artifact.sig"
+            echo "$artifact.sig" >> dist/signing/signatures.txt
+          done < dist/signing/artifacts.txt
+
+      - name: Verify release signing summary
+        run: |
+          python scripts/check_release_signing_summary.py dist/signing
+
+      - name: Upload signing summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-summary-${{ steps.release.outputs.tag }}
+          path: dist/signing/
+
+  release-summary:
+    name: Verify release summary
+    runs-on: ubuntu-latest
+    needs: sign-artifacts
+    if: always()
+    concurrency:
+      group: release-signing-${{ github.ref_name }}-summary
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail partial signing states
+        if: needs.sign-artifacts.result != 'success'
+        run: |
+          echo "Release signing did not complete successfully" >&2
+          exit 1
+      - name: Confirm signing completed
+        run: echo "Release signing completed for ${{ github.ref_name }}"
