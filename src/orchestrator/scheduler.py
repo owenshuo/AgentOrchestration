@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,36 +30,92 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        retention_window: float = 3600.0,
+        clock: Callable[[], float] = time.time,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._retention_window = retention_window
+        self._clock = clock
+        self.catch_up_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = self._clock()
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
+        scheduled_at = self._clock()
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["queue"] = queue
+        task["priority"] = priority
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": scheduled_at + delay,
+            "scheduled_at": scheduled_at,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            task_id
+            for task_id, scheduled in self._scheduled.items()
+            if scheduled["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            if not scheduled:
+                continue
+            if self._is_beyond_retention(scheduled, now):
+                self._record_catch_up_decision(
+                    scheduled,
+                    now,
+                    decision="rejected",
+                    reason="retention_window_exceeded",
+                )
+                continue
+            self._record_catch_up_decision(
+                scheduled,
+                now,
+                decision="accepted",
+                reason="within_retention_window",
+            )
+            self.enqueue(
+                scheduled["task"],
+                scheduled["queue"],
+                scheduled["priority"],
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -80,6 +135,31 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _is_beyond_retention(
+        self,
+        scheduled: Dict[str, Any],
+        now: float,
+    ) -> bool:
+        return now - scheduled["run_at"] > self._retention_window
+
+    def _record_catch_up_decision(
+        self,
+        scheduled: Dict[str, Any],
+        now: float,
+        decision: str,
+        reason: str,
+    ) -> None:
+        self.catch_up_audit.append(
+            {
+                "task_id": scheduled["task"]["id"],
+                "decision": decision,
+                "reason": reason,
+                "run_at": scheduled["run_at"],
+                "evaluated_at": now,
+                "retention_window": self._retention_window,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 

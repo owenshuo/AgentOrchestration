@@ -1,5 +1,15 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+
+
+class ManualClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 class TestTaskScheduler:
@@ -35,6 +45,51 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_catch_up_within_retention_window_dispatches_task(self):
+        clock = ManualClock()
+        scheduler = TaskScheduler(retention_window=60.0, clock=clock)
+        scheduler.schedule({"type": "catch_up"}, delay=10.0)
+        clock.advance(30.0)
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        original_task_id = scheduler.catch_up_audit[0]["task_id"]
+
+        assert task["type"] == "catch_up"
+        assert scheduler.catch_up_audit == [
+            {
+                "task_id": original_task_id,
+                "decision": "accepted",
+                "reason": "within_retention_window",
+                "run_at": 10.0,
+                "evaluated_at": 30.0,
+                "retention_window": 60.0,
+            }
+        ]
+
+    def test_catch_up_beyond_retention_window_rejects_stale_task(self):
+        clock = ManualClock()
+        scheduler = TaskScheduler(retention_window=60.0, clock=clock)
+        task_id = scheduler.schedule({"type": "catch_up"}, delay=10.0)
+        clock.advance(100.0)
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is None
+        assert scheduler._scheduled == {}
+        assert scheduler._in_flight == {}
+        assert scheduler.catch_up_audit == [
+            {
+                "task_id": task_id,
+                "decision": "rejected",
+                "reason": "retention_window_exceeded",
+                "run_at": 10.0,
+                "evaluated_at": 100.0,
+                "retention_window": 60.0,
+            }
+        ]
 
 # 2019-01-09T19:07:03 update
 
