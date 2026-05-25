@@ -27,3 +27,14 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  image-timezone-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: docker build -t agent-orchestrator:timezone-audit .
+      - name: Inspect runtime image timezone
+        run: |
+          python3 scripts/inspect_image_timezone.py \
+            agent-orchestrator:timezone-audit

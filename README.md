@@ -206,3 +206,8 @@ Enterprise License — see [LICENSE](LICENSE) for details.
 # 2026-03-18T16:14:42 update
 
 # 2026-03-21T09:59:35 update
+## Runtime Timezone
+
+Scheduler runtime containers use UTC-only scheduling semantics. The runtime image sets `TZ=UTC`, and scheduled agent deadlines or cron windows should be persisted and compared in UTC. Deployments that need local civil-time presentation should convert at the API or UI boundary before submitting scheduler timestamps.
+
+CI builds the runtime image and runs `scripts/inspect_image_timezone.py` to verify the final image configuration and container runtime both resolve local time as UTC.
