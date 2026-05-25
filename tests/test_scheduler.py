@@ -1,5 +1,15 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+
+
+class ManualClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 class TestTaskScheduler:
@@ -35,6 +45,65 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_large_artifact_upload_renews_lease_without_duplicate_execution(
+        self,
+    ):
+        clock = ManualClock()
+        scheduler = TaskScheduler(
+            lease_ttl=5.0,
+            upload_timeout=60.0,
+            clock=clock,
+        )
+        scheduler.enqueue({"type": "artifact_upload"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.begin_artifact_upload(task["id"])
+
+        clock.advance(4.0)
+        assert scheduler.renew_lease(task["id"])
+        clock.advance(4.0)
+
+        assert not scheduler.is_duplicate_execution_allowed(task["id"])
+        expected_metrics = [
+            {
+                "task_id": task["id"],
+                "reason": "artifact_upload_started",
+                "lease_expires_at": 5.0,
+            },
+            {
+                "task_id": task["id"],
+                "reason": "artifact_upload",
+                "lease_expires_at": 9.0,
+            },
+        ]
+        assert scheduler.lease_renewal_metrics == expected_metrics
+
+    def test_expired_upload_is_recovered_for_retry_path(self):
+        clock = ManualClock()
+        scheduler = TaskScheduler(
+            lease_ttl=5.0,
+            upload_timeout=10.0,
+            clock=clock,
+        )
+        scheduler.enqueue({"type": "artifact_upload"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        original_task_id = task["id"]
+        assert scheduler.begin_artifact_upload(task["id"])
+
+        clock.advance(11.0)
+        recovered = scheduler.recover_expired_uploads()
+        retry = asyncio.run(scheduler.dequeue())
+
+        assert recovered == [original_task_id]
+        assert scheduler.upload_recoveries == [
+            {"task_id": original_task_id, "reason": "upload_timeout"}
+        ]
+        assert retry["upload_state"] == "retry_after_expired_upload"
+        assert retry["retries"] == 1
 
 # 2019-01-09T19:07:03 update
 
