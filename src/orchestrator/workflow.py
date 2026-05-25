@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -14,15 +17,26 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        cleanup_artifacts: Optional[List[str]] = None,
+        retry_dependency_artifacts: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.cleanup_artifacts = cleanup_artifacts or []
+        self.retry_dependency_artifacts = retry_dependency_artifacts or []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.attempts = 0
 
 
 class Workflow:
@@ -33,6 +47,8 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, Any]] = []
+        self.pending_cleanup: Dict[str, List[str]] = {}
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -43,9 +59,64 @@ class Workflow:
         return self._step_map.get(step_id)
 
 
+class WorkflowArtifactCleanupPlanner:
+    """Defers cleanup of artifacts needed by pending retry attempts."""
+
+    def plan_after_failure(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+    ) -> List[str]:
+        remaining_retries = max(step.retries - step.attempts + 1, 0)
+        cleanup = set(step.cleanup_artifacts)
+        retry_dependencies = set(step.retry_dependency_artifacts)
+        protected = sorted(cleanup & retry_dependencies)
+
+        if remaining_retries and protected:
+            workflow.pending_cleanup[step.id] = protected
+            record = {
+                "event": "artifact_cleanup_deferred",
+                "workflow_id": workflow.id,
+                "step_id": step.id,
+                "step_name": step.name,
+                "artifacts": protected,
+                "attempt": step.attempts,
+                "remaining_retries": remaining_retries,
+                "reason": "retry_dependency_data",
+            }
+            workflow.audit_records.append(record)
+            logger.info(
+                "deferred artifact cleanup for retry dependency data",
+                extra={"workflow_id": workflow.id, "step_id": step.id},
+            )
+            return protected
+
+        return []
+
+    def release_after_success(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+    ) -> List[str]:
+        released = workflow.pending_cleanup.pop(step.id, [])
+        if released:
+            workflow.audit_records.append(
+                {
+                    "event": "artifact_cleanup_released",
+                    "workflow_id": workflow.id,
+                    "step_id": step.id,
+                    "step_name": step.name,
+                    "artifacts": released,
+                    "reason": "retry_completed",
+                }
+            )
+        return released
+
+
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.cleanup_planner = WorkflowArtifactCleanupPlanner()
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -68,19 +139,37 @@ class WorkflowManager:
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
-            step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
-                step.status = StepStatus.FAILED
+            if not self._execute_step_with_retries(workflow, step):
                 workflow.status = StepStatus.FAILED
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _execute_step_with_retries(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+    ) -> bool:
+        while True:
+            step.status = StepStatus.RUNNING
+            step.attempts += 1
+            try:
+                result = step.handler()
+                step.result = result
+                step.error = None
+                step.status = StepStatus.COMPLETED
+                self.cleanup_planner.release_after_success(workflow, step)
+                return True
+            except Exception as e:
+                step.error = str(e)
+                step.status = StepStatus.FAILED
+
+                if step.attempts > step.retries:
+                    return False
+
+                self.cleanup_planner.plan_after_failure(workflow, step)
+                step.status = StepStatus.PENDING
 
 # 2019-03-27T19:58:07 update
 
