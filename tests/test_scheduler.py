@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,50 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_does_not_block_immediate_lane(self):
+        import asyncio
+        self.scheduler.schedule({"type": "scheduled"}, delay=60, priority=100)
+        self.scheduler.enqueue({"type": "immediate"}, priority=1)
+
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["type"] == "immediate"
+        assert task["lane"] == "in_flight"
+
+    def test_scheduled_task_promotes_with_payload_when_due(self):
+        import asyncio
+        self.scheduler.schedule(
+            {"type": "scheduled", "payload": {"x": 1}}, delay=0
+        )
+
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["type"] == "scheduled"
+        assert task["payload"] == {"x": 1}
+        assert task["lane"] == "in_flight"
+
+    def test_immediate_enqueue_replaces_duplicate_scheduled_task(self):
+        import asyncio
+        task_id = self.scheduler.schedule(
+            {"id": "same", "type": "scheduled"}, delay=0
+        )
+        assert task_id == "same"
+        self.scheduler.enqueue({"id": "same", "type": "immediate"})
+
+        first = asyncio.run(self.scheduler.dequeue())
+        second = asyncio.run(self.scheduler.dequeue())
+
+        assert first["type"] == "immediate"
+        assert second is None
+
+    def test_failed_task_retries_in_scheduled_lane_once(self):
+        import asyncio
+        self.scheduler.enqueue({"id": "retry-me", "type": "work"})
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        assert asyncio.run(self.scheduler.dequeue()) is None
 
 # 2019-01-09T19:07:03 update
 

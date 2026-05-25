@@ -2,9 +2,12 @@
 
 import asyncio
 import heapq
+import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set, Tuple
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -30,56 +33,157 @@ class PriorityQueue:
         return len(self._queue)
 
 
+class ScheduledLane:
+    def __init__(self):
+        self._due = []
+        self._tasks: Dict[str, Dict] = {}
+        self._cancelled: Set[str] = set()
+
+    def push(self, task: Dict, run_at: float, priority: int = 0) -> None:
+        task_id = task["id"]
+        self._tasks[task_id] = task
+        heapq.heappush(self._due, (run_at, -priority, task_id))
+
+    def pop_ready(self, now: float) -> Optional[Tuple[Dict, int]]:
+        while self._due and self._due[0][0] <= now:
+            _, negative_priority, task_id = heapq.heappop(self._due)
+            if task_id in self._cancelled:
+                self._cancelled.remove(task_id)
+                continue
+            task = self._tasks.pop(task_id, None)
+            if task is not None:
+                return task, -negative_priority
+        return None
+
+    def discard(self, task_id: str) -> bool:
+        if task_id in self._tasks:
+            self._tasks.pop(task_id, None)
+            self._cancelled.add(task_id)
+            return True
+        return False
+
+    def __len__(self) -> int:
+        return len(self._tasks)
+
+
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, ScheduledLane] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._completed: Set[str] = set()
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
+        if task_id in self._completed or task_id in self._in_flight:
+            logger.info("queue enqueue ignored for active or completed task")
+            return task_id
+
+        self._discard_scheduled(task_id)
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("enqueued_at", time.time())
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        task["lane"] = "immediate"
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
+        if task_id in self._completed or task_id in self._in_flight:
+            logger.info(
+                "queue schedule ignored for active or completed task"
+            )
+            return task_id
+
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task.setdefault("enqueued_at", time.time())
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        task["lane"] = "scheduled"
+        task["scheduled_at"] = time.time() + max(delay, 0)
+
+        if queue not in self._scheduled:
+            self._scheduled[queue] = ScheduledLane()
+        self._scheduled[queue].push(task, task["scheduled_at"], priority)
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
+        self._promote_ready_scheduled(queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["lane"] = "in_flight"
                 self._in_flight[task["id"]] = task
                 return task
+
+        if timeout:
+            await asyncio.sleep(0)
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task is None:
+            return False
+        self._completed.add(task_id)
+        return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        if task is None or task_id in self._completed:
+            return False
+
+        task["retries"] += 1
+        if task["retries"] >= self._max_retries:
+            return False
+
+        self.schedule(
+            task,
+            delay=self._retry_delay(task),
+            queue=queue,
+            priority=task.get("priority", 0),
+        )
+        return True
+
+    def _promote_ready_scheduled(self, queue: str) -> None:
+        lane = self._scheduled.get(queue)
+        if lane is None:
+            return
+
+        now = time.time()
+        while True:
+            ready = lane.pop_ready(now)
+            if ready is None:
+                break
+            task, priority = ready
+            task["lane"] = "immediate"
+            logger.info("scheduled task promoted to immediate queue")
+            self.enqueue(task, queue=queue, priority=priority)
+
+    def _discard_scheduled(self, task_id: str) -> None:
+        for lane in self._scheduled.values():
+            if lane.discard(task_id):
+                logger.info("removed duplicate scheduled task before enqueue")
+
+    def _retry_delay(self, task: Dict) -> float:
+        return min(2 ** task["retries"], 30)
 
 # 2019-04-25T08:37:12 update
 
