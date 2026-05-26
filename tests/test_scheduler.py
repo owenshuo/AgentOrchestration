@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,100 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_dequeues_original_payload_once(self):
+        task_id = self.scheduler.schedule(
+            {"type": "test", "payload": {"data": 1}},
+            delay=0,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "test"
+        assert task["payload"] == {"data": 1}
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_schedule_deduplicates_same_run_after_clock_skew(self):
+        first_id = self.scheduler.schedule(
+            {"type": "nightly", "schedule_key": "nightly:2026-05-26"},
+            delay=30,
+        )
+        second_id = self.scheduler.schedule(
+            {"type": "nightly", "schedule_key": "nightly:2026-05-26"},
+            delay=0,
+        )
+
+        assert second_id == first_id
+        assert len(self.scheduler._scheduled) == 1
+
+    def test_deduplicated_scheduled_run_executes_once(self):
+        first_id = self.scheduler.schedule(
+            {"type": "nightly", "schedule_key": "nightly:2026-05-26"},
+            delay=0,
+        )
+        second_id = self.scheduler.schedule(
+            {"type": "nightly", "schedule_key": "nightly:2026-05-26"},
+            delay=0,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert second_id == first_id
+        assert task["id"] == first_id
+        assert task["type"] == "nightly"
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_deduplicates_repeat_schedule_after_dispatch(self):
+        task_id = self.scheduler.schedule(
+            {"type": "nightly", "schedule_key": "nightly:2026-05-26"},
+            delay=0,
+        )
+
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue())
+        repeat_id = self.scheduler.schedule(
+            {"type": "nightly", "schedule_key": "nightly:2026-05-26"},
+            delay=0,
+        )
+        second = asyncio.run(self.scheduler.dequeue())
+
+        assert first["id"] == task_id
+        assert repeat_id == task_id
+        assert second is None
+
+    def test_complete_records_terminal_outcome_once(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert self.scheduler.complete(task_id)
+        assert not self.scheduler.complete(task_id)
+
+    def test_fail_retries_same_task_id_until_terminal(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == task_id
+
+        assert self.scheduler.fail(task_id)
+        retry = asyncio.run(self.scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert retry["retries"] == 1
+
+        assert self.scheduler.fail(task_id)
+        retry = asyncio.run(self.scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert retry["retries"] == 2
+
+        assert not self.scheduler.fail(task_id)
+        assert not self.scheduler.fail(task_id)
 
 # 2019-01-09T19:07:03 update
 
