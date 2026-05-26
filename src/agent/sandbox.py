@@ -55,8 +55,8 @@ class ResourceLimits:
                 raise ValueError(f"{field_name} must be numeric") from exc
         if not isinstance(value, int):
             raise ValueError(f"{field_name} must be numeric")
-        if value < 0:
-            raise ValueError(f"{field_name} must be non-negative")
+        if value <= 0:
+            raise ValueError(f"{field_name} must be positive")
         return value
 
 

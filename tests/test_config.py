@@ -55,9 +55,11 @@ class TestConfig:
     @pytest.mark.parametrize(
         ("field_name", "value", "message"),
         [
-            ("cpu_time", -1, "cpu_time must be non-negative"),
-            ("memory_mb", "-1", "memory_mb must be non-negative"),
-            ("disk_mb", -1, "disk_mb must be non-negative"),
+            ("cpu_time", -1, "cpu_time must be positive"),
+            ("memory_mb", "-1", "memory_mb must be positive"),
+            ("disk_mb", -1, "disk_mb must be positive"),
+            ("cpu_time", 0, "cpu_time must be positive"),
+            ("memory_mb", "0", "memory_mb must be positive"),
             ("cpu_time", "slow", "cpu_time must be numeric"),
             ("memory_mb", "", "memory_mb must be numeric"),
             ("disk_mb", True, "disk_mb must be numeric"),
@@ -78,9 +80,10 @@ class TestConfig:
     @pytest.mark.parametrize(
         ("field_name", "value", "message"),
         [
-            ("cpu_time", -1, "cpu_time must be non-negative"),
-            ("memory_mb", -1, "memory_mb must be non-negative"),
-            ("disk_mb", -1, "disk_mb must be non-negative"),
+            ("cpu_time", -1, "cpu_time must be positive"),
+            ("memory_mb", -1, "memory_mb must be positive"),
+            ("disk_mb", -1, "disk_mb must be positive"),
+            ("disk_mb", 0, "disk_mb must be positive"),
             ("cpu_time", object(), "cpu_time must be numeric"),
         ],
     )
