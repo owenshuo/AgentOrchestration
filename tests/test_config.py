@@ -34,24 +34,26 @@ class TestConfig:
 
     @pytest.mark.parametrize(
         "key",
-        ["", ".database", "database..host", "database."],
+        ["", ".database", "database..host", "database.", "database...host"],
     )
     def test_get_rejects_empty_dotted_key_segments(self, key):
         config = Config()
 
-        with pytest.raises(ValueError, match="empty path segments"):
+        with pytest.raises(ValueError, match="empty path segments") as excinfo:
             config.get(key)
+        assert repr(key) in str(excinfo.value)
 
     @pytest.mark.parametrize(
         "key",
-        ["", ".database", "database..host", "database."],
+        ["", ".database", "database..host", "database.", "database...host"],
     )
     def test_set_rejects_empty_dotted_key_segments(self, key):
         config = Config()
 
-        with pytest.raises(ValueError, match="empty path segments"):
+        with pytest.raises(ValueError, match="empty path segments") as excinfo:
             config.set(key, "value")
 
+        assert repr(key) in str(excinfo.value)
         assert config.to_dict() == {}
 
 # 2019-02-01T18:58:35 update

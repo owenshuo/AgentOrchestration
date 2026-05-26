@@ -31,7 +31,7 @@ class Config:
         parts = key.split(".")
         if not key or any(part == "" for part in parts):
             raise ValueError(
-                "Config key must not contain empty path segments"
+                f"Config key {key!r} must not contain empty path segments"
             )
         return parts
 
