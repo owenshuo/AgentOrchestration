@@ -1,22 +1,39 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Cookie, Header, HTTPException
+from pydantic import BaseModel, Field
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.live_updates_auth import (
+    LiveUpdateAuthError,
+    LiveUpdateAuthService,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+live_update_auth = LiveUpdateAuthService()
+
+
+class LiveUpdateTokenRequest(BaseModel):
+    workspace_id: str = Field(..., min_length=1)
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +70,23 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/live-updates/token")
+async def mint_live_update_token(
+    request: LiveUpdateTokenRequest,
+    authorization: Optional[str] = Header(default=None),
+    ao_session: Optional[str] = Cookie(default=None),
+):
+    try:
+        token = live_update_auth.mint(
+            workspace_id=request.workspace_id,
+            authorization_header=authorization or "",
+            browser_session=ao_session or "",
+        )
+    except LiveUpdateAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return token.public_view()
 
 # 2019-03-18T11:10:18 update
 
