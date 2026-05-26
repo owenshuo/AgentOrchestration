@@ -1,6 +1,5 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
@@ -21,12 +20,23 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._tenant_index: Dict[str, Dict[str, List[str]]] = {}
+        self._audit_events: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+        tenant_id: str = "default",
+    ) -> str:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
             "id": agent_id,
+            "tenant_id": tenant_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
@@ -40,19 +50,93 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        tenant_groups = self._tenant_index.setdefault(tenant_id, {})
+        tenant_groups.setdefault(group, []).append(agent_id)
+        self._audit(
+            "registered",
+            tenant_id,
+            agent_type,
+            {"agent_id": agent_id, "group": group},
+        )
         return agent_id
 
-    def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        return self._agents.get(agent_id)
+    def get(
+        self,
+        agent_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return None
+        if tenant_id and agent["tenant_id"] != tenant_id:
+            self._audit(
+                "tenant_mismatch",
+                tenant_id,
+                agent["type"],
+                {"requested_agent_id": agent_id},
+            )
+            return None
+        return agent
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
+        if tenant_id:
+            groups = self._tenant_index.get(tenant_id, {})
+            if group:
+                agent_ids = groups.get(group, [])
+            else:
+                agent_ids = [
+                    agent_id
+                    for group_ids in groups.values()
+                    for agent_id in group_ids
+                ]
+            agents = [a for a in agents if a["id"] in agent_ids]
         if status:
             agents = [a for a in agents if a["status"] == status.value]
-        if group:
+        if group and not tenant_id:
             agent_ids = self._index.get(group, [])
             agents = [a for a in agents if a["id"] in agent_ids]
         return list(agents)
+
+    def resolve(
+        self,
+        agent_type: str,
+        tenant_id: str,
+        status: AgentStatus = AgentStatus.RUNNING,
+    ) -> Optional[Dict[str, Any]]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        group = agent_type.split(".")[0]
+        candidates = [
+            agent
+            for agent in self.list(
+                status=status,
+                group=group,
+                tenant_id=tenant_id,
+            )
+            if agent["type"] == agent_type
+        ]
+        if not candidates:
+            self._audit(
+                "resolution_deferred",
+                tenant_id,
+                agent_type,
+                {"reason": "no_tenant_scoped_handler"},
+            )
+            return None
+        resolved = sorted(candidates, key=lambda agent: agent["updated_at"])[0]
+        self._audit(
+            "resolved",
+            tenant_id,
+            agent_type,
+            {"agent_id": resolved["id"], "group": group},
+        )
+        return resolved
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
@@ -68,10 +152,40 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        tenant_groups = self._tenant_index.get(agent["tenant_id"], {})
+        tenant_ids = tenant_groups.get(group, [])
+        if agent_id in tenant_ids:
+            tenant_ids.remove(agent_id)
+        self._audit(
+            "deleted",
+            agent["tenant_id"],
+            agent["type"],
+            {"agent_id": agent_id, "group": group},
+        )
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_report(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._audit_events]
+
+    def _audit(
+        self,
+        action: str,
+        tenant_id: str,
+        agent_type: str,
+        details: Dict[str, Any],
+    ) -> None:
+        self._audit_events.append(
+            {
+                "action": action,
+                "tenant_id": tenant_id,
+                "agent_type": agent_type,
+                "details": dict(details),
+                "timestamp": time.time(),
+            }
+        )
 
 # 2019-01-29T11:24:49 update
 

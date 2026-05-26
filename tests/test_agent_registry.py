@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -17,6 +16,7 @@ class TestAgentRegistry:
         assert agent is not None
         assert agent["name"] == "test-agent"
         assert agent["type"] == "worker.processor"
+        assert agent["tenant_id"] == "default"
 
     def test_get_nonexistent_agent(self):
         agent = self.registry.get("nonexistent-id")
@@ -34,6 +34,42 @@ class TestAgentRegistry:
         workers = self.registry.list(group="worker")
         assert len(workers) == 1
 
+    def test_list_agents_by_tenant_and_group(self):
+        self.registry.register(
+            "agent-1",
+            "worker.processor",
+            tenant_id="tenant-a",
+        )
+        self.registry.register(
+            "agent-2",
+            "worker.processor",
+            tenant_id="tenant-b",
+        )
+        self.registry.register(
+            "agent-3",
+            "monitor.watcher",
+            tenant_id="tenant-a",
+        )
+
+        workers = self.registry.list(group="worker", tenant_id="tenant-a")
+
+        assert len(workers) == 1
+        assert workers[0]["name"] == "agent-1"
+
+    def test_get_agent_rejects_cross_tenant_lookup(self):
+        agent_id = self.registry.register(
+            "agent-1",
+            "worker.processor",
+            tenant_id="tenant-a",
+        )
+
+        assert self.registry.get(agent_id, tenant_id="tenant-b") is None
+        assert self.registry.get(agent_id, tenant_id="tenant-a") is not None
+
+        audit = self.registry.audit_report()
+        assert audit[-1]["action"] == "tenant_mismatch"
+        assert "config" not in str(audit)
+
     def test_update_status(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
@@ -44,6 +80,41 @@ class TestAgentRegistry:
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.delete(agent_id)
         assert self.registry.count() == 0
+
+    def test_resolve_is_scoped_to_tenant(self):
+        tenant_a = self.registry.register(
+            "agent-a",
+            "worker.processor",
+            tenant_id="tenant-a",
+        )
+        tenant_b = self.registry.register(
+            "agent-b",
+            "worker.processor",
+            tenant_id="tenant-b",
+        )
+        self.registry.update_status(tenant_a, AgentStatus.RUNNING)
+        self.registry.update_status(tenant_b, AgentStatus.RUNNING)
+
+        resolved = self.registry.resolve("worker.processor", "tenant-a")
+
+        assert resolved is not None
+        assert resolved["id"] == tenant_a
+        assert resolved["tenant_id"] == "tenant-a"
+
+    def test_resolve_defers_when_only_other_tenant_has_handler(self):
+        other_tenant = self.registry.register(
+            "agent-b",
+            "worker.processor",
+            tenant_id="tenant-b",
+        )
+        self.registry.update_status(other_tenant, AgentStatus.RUNNING)
+
+        assert self.registry.resolve("worker.processor", "tenant-a") is None
+
+        audit = self.registry.audit_report()
+        assert audit[-1]["action"] == "resolution_deferred"
+        assert audit[-1]["tenant_id"] == "tenant-a"
+        assert audit[-1]["details"]["reason"] == "no_tenant_scoped_handler"
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
