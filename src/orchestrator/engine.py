@@ -2,13 +2,16 @@
 
 import asyncio
 import logging
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
+
+TERMINAL_TASK_STATES = {"completed", "failed", "cancelled"}
 
 
 class OrchestrationEngine:
@@ -18,6 +21,9 @@ class OrchestrationEngine:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
+        self._reducer_errors: Deque[Dict[str, Any]] = deque(maxlen=100)
+        self._task_revisions: Dict[str, int] = {}
+        self._task_attempts: Dict[str, int] = {}
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -28,6 +34,111 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    @property
+    def reducer_errors(self) -> List[Dict[str, Any]]:
+        return [dict(error) for error in self._reducer_errors]
+
+    def _record_reducer_error(
+        self,
+        task: Dict[str, Any],
+        reason: str,
+        attempted_state: str,
+        expected_revision: Optional[int],
+        actual_revision: int,
+        expected_attempt: Optional[int],
+        actual_attempt: int,
+    ) -> None:
+        error = {
+            "task_id": task["id"],
+            "reason": reason,
+            "attempted_state": attempted_state,
+            "current_state": task.get("state", "queued"),
+            "expected_revision": expected_revision,
+            "actual_revision": actual_revision,
+            "expected_attempt": expected_attempt,
+            "actual_attempt": actual_attempt,
+        }
+        self._reducer_errors.append(error)
+        logger.warning(
+            "Rejected task reducer transition",
+            extra={"reducer_error": error},
+        )
+
+    def _reduce_task_state(
+        self,
+        task: Dict[str, Any],
+        next_state: str,
+        expected_revision: Optional[int] = None,
+        expected_attempt: Optional[int] = None,
+    ) -> bool:
+        task_id = task["id"]
+        current_state = task.get("state", "queued")
+        actual_revision = self._task_revisions.get(
+            task_id,
+            int(task.get("revision", 0)),
+        )
+        actual_attempt = self._task_attempts.get(
+            task_id,
+            int(task.get("attempt", 0)),
+        )
+
+        if (
+            expected_revision is not None
+            and expected_revision != actual_revision
+        ):
+            self._record_reducer_error(
+                task,
+                "stale_revision",
+                next_state,
+                expected_revision,
+                actual_revision,
+                expected_attempt,
+                actual_attempt,
+            )
+            return False
+
+        if expected_attempt is not None and expected_attempt != actual_attempt:
+            self._record_reducer_error(
+                task,
+                "stale_attempt",
+                next_state,
+                expected_revision,
+                actual_revision,
+                expected_attempt,
+                actual_attempt,
+            )
+            return False
+
+        if (
+            current_state in TERMINAL_TASK_STATES
+            and current_state != next_state
+        ):
+            self._record_reducer_error(
+                task,
+                "terminal_state",
+                next_state,
+                expected_revision,
+                actual_revision,
+                expected_attempt,
+                actual_attempt,
+            )
+            return False
+
+        revision = actual_revision + 1
+        task["state"] = next_state
+        task["revision"] = revision
+        task["attempt"] = actual_attempt
+        self._task_revisions[task_id] = revision
+        self._task_attempts[task_id] = actual_attempt
+        return True
+
+    def _begin_task_attempt(self, task: Dict[str, Any]) -> None:
+        task_id = task["id"]
+        attempt = self._task_attempts.get(task_id, int(task.get("attempt", 0)))
+        attempt += 1
+        task["attempt"] = attempt
+        self._task_attempts[task_id] = attempt
 
     async def start(self) -> None:
         self._running = True
@@ -47,6 +158,12 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
+        task.setdefault("state", "queued")
+        task.setdefault("revision", 0)
+        task.setdefault("attempt", 0)
+        self._task_revisions.setdefault(task_id, int(task["revision"]))
+        self._task_attempts.setdefault(task_id, int(task["attempt"]))
+
         for hook in self._hooks["pre_execute"]:
             await hook(task)
 
@@ -55,11 +172,28 @@ class OrchestrationEngine:
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
 
+            self._begin_task_attempt(task)
+            expected_attempt = task["attempt"]
+            if not self._reduce_task_state(
+                task,
+                "running",
+                expected_revision=task["revision"],
+                expected_attempt=expected_attempt,
+            ):
+                return
+
             self.registry.update_status(agent_id, AgentStatus.RUNNING)
             result = await asyncio.wait_for(
                 self._run_agent_task(agent, task),
                 timeout=self.agent_timeout,
             )
+            if not self._reduce_task_state(
+                task,
+                "completed",
+                expected_revision=task["revision"],
+                expected_attempt=expected_attempt,
+            ):
+                return
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
             for hook in self._hooks["post_execute"]:
@@ -68,6 +202,12 @@ class OrchestrationEngine:
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
+            self._reduce_task_state(
+                task,
+                "failed",
+                expected_revision=task.get("revision"),
+                expected_attempt=task.get("attempt"),
+            )
             logger.error(f"Task {task_id} failed: {e}")
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
@@ -82,7 +222,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
