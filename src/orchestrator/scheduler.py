@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,9 +34,16 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._claim_revision = 0
+        self._audit_events: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +54,24 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        worker_id: Optional[str] = None,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +82,93 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._claim_revision += 1
+                task["claim_owner"] = worker_id or "anonymous-worker"
+                task["claim_token"] = str(uuid4())
+                task["claim_revision"] = self._claim_revision
+                task["claimed_at"] = now
                 self._in_flight[task["id"]] = task
+                self._audit("claimed", task)
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(
+        self,
+        task_id: str,
+        worker_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not self._owns_claim(task, worker_id, claim_token):
+            self._audit("complete_rejected", task, worker_id)
+            return False
+        self._in_flight.pop(task_id, None)
+        self._audit("completed", task, worker_id)
+        return True
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        worker_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not self._owns_claim(task, worker_id, claim_token):
+            self._audit("fail_rejected", task, worker_id)
+            return False
+        self._in_flight.pop(task_id, None)
+        task["retries"] += 1
+        if task["retries"] < self._max_retries:
+            self._clear_claim(task)
+            self.enqueue(task, queue, priority=task.get("priority", 0))
+            self._audit("retry_enqueued", task, worker_id)
+            return True
         return False
+
+    def audit_report(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._audit_events]
+
+    @staticmethod
+    def _clear_claim(task: Dict[str, Any]) -> None:
+        claim_keys = (
+            "claim_owner",
+            "claim_token",
+            "claim_revision",
+            "claimed_at",
+        )
+        for key in claim_keys:
+            task.pop(key, None)
+
+    def _owns_claim(
+        self,
+        task: Optional[Dict[str, Any]],
+        worker_id: Optional[str],
+        claim_token: Optional[str],
+    ) -> bool:
+        if not task:
+            return False
+        if worker_id and task.get("claim_owner") != worker_id:
+            return False
+        if claim_token and task.get("claim_token") != claim_token:
+            return False
+        return True
+
+    def _audit(
+        self,
+        action: str,
+        task: Optional[Dict[str, Any]],
+        worker_id: Optional[str] = None,
+    ) -> None:
+        self._audit_events.append(
+            {
+                "action": action,
+                "task_id": task.get("id") if task else None,
+                "claim_owner": worker_id or (task or {}).get("claim_owner"),
+                "claim_revision": (task or {}).get("claim_revision"),
+                "timestamp": time.time(),
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 

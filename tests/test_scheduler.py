@@ -1,4 +1,4 @@
-import pytest
+import asyncio
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +12,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +19,79 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_records_claim_owner_token_and_revision_atomically(self):
+        self.scheduler.enqueue({"type": "race"})
+
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        assert task["claim_owner"] == "worker-a"
+        assert task["claim_token"]
+        assert task["claim_revision"] == 1
+        assert task["claimed_at"] >= task["enqueued_at"]
+
+    def test_second_worker_cannot_complete_claimed_task(self):
+        self.scheduler.enqueue({"type": "race"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        assert not self.scheduler.complete(
+            task["id"],
+            worker_id="worker-b",
+            claim_token=task["claim_token"],
+        )
+        assert self.scheduler.complete(
+            task["id"],
+            worker_id="worker-a",
+            claim_token=task["claim_token"],
+        )
+
+    def test_stale_claim_token_cannot_fail_and_requeue_task(self):
+        self.scheduler.enqueue({"type": "race"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        original_claim_token = task["claim_token"]
+
+        assert not self.scheduler.fail(
+            task["id"],
+            worker_id="worker-a",
+            claim_token="stale-token",
+        )
+        assert self.scheduler.fail(
+            task["id"],
+            worker_id="worker-a",
+            claim_token=task["claim_token"],
+        )
+
+        retried = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+        assert retried["claim_owner"] == "worker-b"
+        assert retried["claim_token"] != original_claim_token
+        assert retried["claim_revision"] == 2
+
+    def test_claim_audit_is_sanitized(self):
+        self.scheduler.enqueue({"type": "race", "payload": {"secret": "x"}})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        self.scheduler.complete(
+            task["id"],
+            worker_id="worker-a",
+            claim_token=task["claim_token"],
+        )
+
+        audit = self.scheduler.audit_report()
+
+        assert [event["action"] for event in audit] == ["claimed", "completed"]
+        assert "secret" not in str(audit)
+        assert task["claim_token"] not in str(audit)
 
 # 2019-01-09T19:07:03 update
 
