@@ -1,10 +1,9 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 class AgentStatus(Enum):
@@ -14,6 +13,7 @@ class AgentStatus(Enum):
     STOPPED = "stopped"
     FAILED = "failed"
     TERMINATED = "terminated"
+    RETIRED = "retired"
 
 
 class AgentRegistry:
@@ -21,8 +21,48 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._revision = 0
+        self._listeners: List[Callable[[Dict[str, Any]], None]] = []
+        self._audit_events: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def subscribe_changes(
+        self,
+        callback: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        if callback not in self._listeners:
+            self._listeners.append(callback)
+
+    def _publish_change(
+        self,
+        action: str,
+        agent: Dict[str, Any],
+        reason: str = "",
+    ) -> None:
+        self._revision += 1
+        event = {
+            "revision": self._revision,
+            "action": action,
+            "agent_id": agent["id"],
+            "agent_type": agent["type"],
+            "group": agent["type"].split(".")[0],
+            "status": agent["status"],
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._audit_events.append(event)
+        for listener in list(self._listeners):
+            listener(dict(event))
+
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -40,12 +80,17 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._publish_change("registered", self._agents[agent_id])
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,6 +104,30 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        retirement_statuses = {
+            AgentStatus.STOPPED,
+            AgentStatus.TERMINATED,
+            AgentStatus.RETIRED,
+        }
+        if status in retirement_statuses:
+            action = "retired"
+        else:
+            action = "status_changed"
+        self._publish_change(action, self._agents[agent_id])
+        return True
+
+    def retire_handler(
+        self,
+        agent_id: str,
+        reason: str = "handler_retired",
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+        agent = self._agents[agent_id]
+        agent["status"] = AgentStatus.RETIRED.value
+        agent["updated_at"] = time.time()
+        agent["retired_at"] = agent["updated_at"]
+        self._publish_change("retired", agent, reason=reason)
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +137,16 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        agent = dict(agent)
+        agent["status"] = AgentStatus.RETIRED.value
+        self._publish_change("deregistered", agent)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_report(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._audit_events]
 
 # 2019-01-29T11:24:49 update
 

@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +38,27 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_retire_handler_notifies_subscribers_without_private_config(self):
+        events = []
+        self.registry.subscribe_changes(events.append)
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"token": "private", "url": "https://internal.example"},
+        )
+
+        assert self.registry.retire_handler(agent_id, reason="maintenance")
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RETIRED.value
+        retirement = events[-1]
+        assert retirement["action"] == "retired"
+        assert retirement["agent_id"] == agent_id
+        assert retirement["agent_type"] == "worker.processor"
+        assert "config" not in retirement
+        assert "private" not in str(retirement)
+        assert self.registry.revision == retirement["revision"]
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")

@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+from src.agent.registry import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,77 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_deregistered_handler_invalidates_scheduler_resolution_cache(self):
+        registry = AgentRegistry()
+        agent_id = registry.register("processor", "worker.processor")
+        registry.update_status(agent_id, AgentStatus.RUNNING)
+        scheduler = TaskScheduler(registry)
+
+        scheduler.enqueue(
+            {"type": "process", "handler_type": "worker.processor"},
+        )
+        first_task = asyncio.run(scheduler.dequeue())
+        assert first_task["resolved_agent_id"] == agent_id
+        assert scheduler.complete(first_task["id"])
+
+        registry.retire_handler(agent_id, reason="handler_retirement")
+        scheduler.enqueue(
+            {"type": "process", "handler_type": "worker.processor"},
+        )
+
+        assert asyncio.run(scheduler.dequeue()) is None
+        deferred = scheduler.deferred_tasks()
+        assert len(deferred) == 1
+        assert (
+            deferred[0]["deferred_reason"]
+            == "handler_retired_or_unavailable"
+        )
+        assert deferred[0]["registry_revision"] == registry.revision
+
+        audit = scheduler.audit_report()
+        assert any(
+            event["action"] == "handler_cache_invalidated"
+            for event in audit
+        )
+        assert any(event["action"] == "task_deferred" for event in audit)
+        assert "payload" not in str(audit)
+
+    def test_scheduler_resolves_replacement_handler_after_retirement(self):
+        registry = AgentRegistry()
+        old_agent = registry.register("old", "worker.processor")
+        registry.update_status(old_agent, AgentStatus.RUNNING)
+        scheduler = TaskScheduler(registry)
+
+        scheduler.enqueue(
+            {"type": "process", "handler_type": "worker.processor"},
+        )
+        first_task = asyncio.run(scheduler.dequeue())
+        assert first_task["resolved_agent_id"] == old_agent
+        assert scheduler.complete(first_task["id"])
+
+        registry.retire_handler(old_agent)
+        new_agent = registry.register("new", "worker.processor")
+        registry.update_status(new_agent, AgentStatus.RUNNING)
+        scheduler.enqueue(
+            {"type": "process", "handler_type": "worker.processor"},
+        )
+
+        next_task = asyncio.run(scheduler.dequeue())
+        assert next_task["resolved_agent_id"] == new_agent
+        assert next_task["resolved_agent_id"] != old_agent
 
 # 2019-01-09T19:07:03 update
 

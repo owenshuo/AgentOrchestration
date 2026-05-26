@@ -1,10 +1,11 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
+
+from src.agent.registry import AgentRegistry, AgentStatus
 
 
 class PriorityQueue:
@@ -31,13 +32,41 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, registry: Optional[AgentRegistry] = None):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._deferred: Dict[str, Dict] = {}
+        self._resolution_cache: Dict[str, Dict[str, Any]] = {}
+        self._retired_agents: Set[str] = set()
+        self._audit_events: List[Dict[str, Any]] = []
         self._max_retries = 3
+        self.registry: Optional[AgentRegistry] = None
+        if registry:
+            self.bind_registry(registry)
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def bind_registry(self, registry: AgentRegistry) -> None:
+        self.registry = registry
+        registry.subscribe_changes(self.handle_registry_change)
+        self._resolution_cache.clear()
+
+    def handle_registry_change(self, event: Dict[str, Any]) -> None:
+        action = event.get("action")
+        if action in {"retired", "deregistered", "status_changed"}:
+            agent_id = event.get("agent_id")
+            agent_type = event.get("agent_type")
+            if agent_id and action in {"retired", "deregistered"}:
+                self._retired_agents.add(agent_id)
+            if agent_type:
+                self._resolution_cache.pop(agent_type, None)
+            self._audit("handler_cache_invalidated", None, event)
+
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +77,71 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def _target_handler_type(self, task: Dict[str, Any]) -> Optional[str]:
+        return (
+            task.get("handler_type")
+            or task.get("agent_type")
+            or task.get("handler")
+        )
+
+    def _resolve_handler(
+        self,
+        task: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.registry:
+            return None
+        handler_type = self._target_handler_type(task)
+        if not handler_type:
+            return None
+        cached = self._resolution_cache.get(handler_type)
+        if (
+            cached
+            and cached.get("registry_revision") == self.registry.revision
+        ):
+            agent = self.registry.get(cached["agent_id"])
+            if agent and agent["status"] == AgentStatus.RUNNING.value:
+                return agent
+            self._resolution_cache.pop(handler_type, None)
+
+        group = handler_type.split(".")[0]
+        candidates = [
+            agent
+            for agent in self.registry.list(
+                status=AgentStatus.RUNNING,
+                group=group,
+            )
+            if (
+                agent["type"] == handler_type
+                and agent["id"] not in self._retired_agents
+            )
+        ]
+        if not candidates:
+            return None
+
+        agent = sorted(candidates, key=lambda item: item["updated_at"])[0]
+        self._resolution_cache[handler_type] = {
+            "agent_id": agent["id"],
+            "registry_revision": self.registry.revision,
+        }
+        return agent
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,6 +152,24 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                handler_type = self._target_handler_type(task)
+                if self.registry and handler_type:
+                    handler = self._resolve_handler(task)
+                    if not handler:
+                        task["deferred_reason"] = (
+                            "handler_retired_or_unavailable"
+                        )
+                        task["deferred_at"] = time.time()
+                        task["registry_revision"] = self.registry.revision
+                        self._deferred[task["id"]] = task
+                        self._audit(
+                            "task_deferred",
+                            task,
+                            {"handler_type": handler_type},
+                        )
+                        return None
+                    task["resolved_agent_id"] = handler["id"]
+                    task["registry_revision"] = self.registry.revision
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +185,30 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def deferred_tasks(self) -> List[Dict[str, Any]]:
+        return [dict(task) for task in self._deferred.values()]
+
+    def audit_report(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._audit_events]
+
+    def _audit(
+        self,
+        action: str,
+        task: Optional[Dict[str, Any]],
+        details: Dict[str, Any],
+    ) -> None:
+        event = {
+            "action": action,
+            "task_id": task.get("id") if task else None,
+            "details": {
+                key: value
+                for key, value in details.items()
+                if key not in {"payload", "config", "secret", "token"}
+            },
+            "timestamp": time.time(),
+        }
+        self._audit_events.append(event)
 
 # 2019-04-25T08:37:12 update
 
