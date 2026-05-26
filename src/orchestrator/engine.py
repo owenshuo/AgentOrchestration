@@ -6,17 +6,34 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.orchestrator.policy import (
+    AllowAllPolicyEngine,
+    PolicyRejectedError,
+    PolicyRuntime,
+    PolicyUnavailableError,
+)
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
+_DEFAULT_POLICY = object()
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        policy_engine: Optional[Any] = _DEFAULT_POLICY,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        if policy_engine is _DEFAULT_POLICY:
+            policy_engine = AllowAllPolicyEngine()
+        self.policy_runtime = PolicyRuntime(policy_engine)
+        self._terminal_outcomes: Dict[str, Dict[str, Any]] = {}
+        self._outcome_lock = asyncio.Lock()
         self._running = False
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
@@ -47,13 +64,22 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
-        for hook in self._hooks["pre_execute"]:
-            await hook(task)
+        if task_id in self._terminal_outcomes:
+            return
 
         try:
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
+
+            await self.policy_runtime.authorize(
+                {"name": "execute_task"},
+                task,
+                agent,
+            )
+
+            for hook in self._hooks["pre_execute"]:
+                await hook(task)
 
             self.registry.update_status(agent_id, AgentStatus.RUNNING)
             result = await asyncio.wait_for(
@@ -61,14 +87,33 @@ class OrchestrationEngine:
                 timeout=self.agent_timeout,
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
+            await self._record_terminal_outcome(
+                task_id,
+                "completed",
+                result=result,
+            )
 
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
 
+        except (PolicyUnavailableError, PolicyRejectedError) as e:
+            await self._record_terminal_outcome(
+                task_id,
+                "failed",
+                error=str(e),
+                reason="policy_unavailable"
+                if isinstance(e, PolicyUnavailableError)
+                else "policy_rejected",
+            )
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            await self._record_terminal_outcome(
+                task_id,
+                "failed",
+                error=str(e),
+            )
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +127,32 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
+
+    async def _record_terminal_outcome(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        result: Any = None,
+        error: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        outcome = {
+            "task_id": task_id,
+            "status": status,
+            "result": result,
+            "error": error,
+            "reason": reason,
+        }
+        async with self._outcome_lock:
+            return self._terminal_outcomes.setdefault(task_id, outcome)
+
+    def get_task_outcome(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._terminal_outcomes.get(task_id)
 
 # 2019-04-24T14:55:39 update
 
