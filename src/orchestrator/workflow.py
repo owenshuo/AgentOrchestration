@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -14,7 +15,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -33,6 +40,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.parameters: Dict[str, Any] = {}
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -41,6 +49,72 @@ class Workflow:
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+
+@dataclass(frozen=True)
+class ParameterMergeResult:
+    parameters: Dict[str, Any]
+    applied_defaults: List[str] = field(default_factory=list)
+    applied_overrides: List[str] = field(default_factory=list)
+    deferred: bool = False
+    reason: str = "merged"
+    audit: Dict[str, Any] = field(default_factory=dict)
+
+
+def merge_workflow_parameters(
+    defaults: Dict[str, Any],
+    overrides: Dict[str, Any],
+) -> ParameterMergeResult:
+    parameters = dict(defaults)
+    parameters.update(overrides)
+    default_keys = sorted(defaults)
+    override_keys = sorted(overrides)
+    return ParameterMergeResult(
+        parameters=parameters,
+        applied_defaults=default_keys,
+        applied_overrides=override_keys,
+        audit={
+            "decision": "allow",
+            "reason": "merged",
+            "default_keys": default_keys,
+            "override_keys": override_keys,
+        },
+    )
+
+
+def bind_workflow_parameters(
+    workflow: Workflow,
+    defaults: Dict[str, Any],
+    overrides: Dict[str, Any],
+) -> ParameterMergeResult:
+    if workflow.status != StepStatus.PENDING:
+        existing_keys = sorted(workflow.parameters)
+        return ParameterMergeResult(
+            parameters=dict(workflow.parameters),
+            deferred=True,
+            reason="workflow_lifecycle_not_mutable",
+            audit={
+                "decision": "defer",
+                "reason": "workflow_lifecycle_not_mutable",
+                "workflow_id": workflow.id,
+                "workflow_status": workflow.status.value,
+                "existing_parameter_keys": existing_keys,
+            },
+        )
+
+    result = merge_workflow_parameters(defaults, overrides)
+    workflow.parameters = dict(result.parameters)
+    audit = dict(result.audit)
+    audit["workflow_id"] = workflow.id
+    audit["workflow_status"] = workflow.status.value
+    return ParameterMergeResult(
+        parameters=dict(result.parameters),
+        applied_defaults=list(result.applied_defaults),
+        applied_overrides=list(result.applied_overrides),
+        deferred=False,
+        reason=result.reason,
+        audit=audit,
+    )
 
 
 class WorkflowManager:
