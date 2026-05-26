@@ -2,7 +2,10 @@
 
 import os
 import json
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+import yaml
 
 
 class Config:
@@ -13,8 +16,24 @@ class Config:
         self._load_env_overrides()
 
     def load(self, path: str) -> None:
-        with open(path) as f:
-            self._data = json.load(f)
+        config_path = Path(path)
+        suffix = config_path.suffix.lower()
+
+        with config_path.open() as f:
+            if suffix == ".json":
+                data = json.load(f)
+            elif suffix in {".yaml", ".yml"}:
+                data = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    "Unsupported config format. Use .json, .yaml, or .yml"
+                )
+
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError("Config root must be a mapping")
+        self._data = data
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"

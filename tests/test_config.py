@@ -10,6 +10,44 @@ class TestConfig:
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
 
+    def test_load_yaml_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "app:\n"
+            "  name: yaml-test\n"
+            "  port: 9090\n"
+            "features:\n"
+            "  retries: true\n"
+        )
+
+        config = Config(str(config_file))
+
+        assert config.get("app.name") == "yaml-test"
+        assert config.get("app.port") == 9090
+        assert config.get("features.retries") is True
+
+    def test_load_yml_config(self, tmp_path):
+        config_file = tmp_path / "config.yml"
+        config_file.write_text("app:\n  name: short-yaml\n")
+
+        config = Config(str(config_file))
+
+        assert config.get("app.name") == "short-yaml"
+
+    def test_rejects_unsupported_config_extension(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[app]\nname = 'toml-test'\n")
+
+        with pytest.raises(ValueError, match="Unsupported config format"):
+            Config(str(config_file))
+
+    def test_rejects_non_mapping_config_root(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("- not\n- a\n- mapping\n")
+
+        with pytest.raises(ValueError, match="Config root must be a mapping"):
+            Config(str(config_file))
+
     def test_default_value(self):
         config = Config()
         assert config.get("nonexistent.key", "default") == "default"
