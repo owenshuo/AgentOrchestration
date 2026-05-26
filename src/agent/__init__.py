@@ -3,7 +3,7 @@
 from .registry import AgentRegistry, AgentStatus
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
-from .sandbox import AgentSandbox
+from .sandbox import AgentSandbox, ResourceLimits
 
 __all__ = [
     "AgentRegistry",
@@ -11,6 +11,7 @@ __all__ = [
     "AgentExecutor",
     "AgentRuntime",
     "AgentSandbox",
+    "ResourceLimits",
 ]
 
 # 2019-02-05T12:34:30 update

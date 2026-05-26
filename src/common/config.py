@@ -47,6 +47,11 @@ class Config:
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
+    def get_sandbox_resource_limits(self):
+        from src.agent.sandbox import ResourceLimits
+
+        return ResourceLimits.from_config(self)
+
     def to_dict(self) -> Dict:
         return self._data
 

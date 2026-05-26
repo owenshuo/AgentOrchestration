@@ -52,6 +52,18 @@ class TestConfig:
         assert limits.memory_mb == 1024
         assert limits.disk_mb == 2048
 
+    def test_config_exposes_sandbox_resource_limits(self):
+        config = Config()
+        config.set("sandbox.cpu_time", 30)
+        config.set("sandbox.memory_mb", 256)
+        config.set("sandbox.disk_mb", 128)
+
+        limits = config.get_sandbox_resource_limits()
+
+        assert limits.cpu_time == 30
+        assert limits.memory_mb == 256
+        assert limits.disk_mb == 128
+
     @pytest.mark.parametrize(
         ("field_name", "value", "message"),
         [
