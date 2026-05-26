@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -14,7 +15,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -33,6 +40,9 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.revision = 0
+        self.attempt = 0
+        self.finalized_attempt: Optional[int] = None
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -46,6 +56,7 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.finalizer = WorkflowFinalizer()
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -65,7 +76,15 @@ class WorkflowManager:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
+        if workflow.status in {StepStatus.COMPLETED, StepStatus.FAILED}:
+            return workflow.status == StepStatus.COMPLETED
 
+        workflow.attempt += 1
+        token = WorkflowFinalizationToken(
+            workflow_id=workflow.id,
+            attempt=workflow.attempt,
+            revision=workflow.revision,
+        )
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
@@ -76,11 +95,106 @@ class WorkflowManager:
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                self.finalizer.finalize(workflow, token, StepStatus.FAILED)
                 return False
 
-        workflow.status = StepStatus.COMPLETED
+        return self.finalizer.finalize(
+            workflow,
+            token,
+            StepStatus.COMPLETED,
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowFinalizationToken:
+    workflow_id: str
+    attempt: int
+    revision: int
+
+
+class WorkflowFinalizer:
+    def __init__(self):
+        self.audit_records: List[Dict[str, Any]] = []
+
+    def finalize(
+        self,
+        workflow: Workflow,
+        token: WorkflowFinalizationToken,
+        status: StepStatus,
+    ) -> bool:
+        if token.workflow_id != workflow.id:
+            self._record(
+                "rejected",
+                token,
+                reason="workflow_mismatch",
+                current_status=workflow.status,
+            )
+            return False
+        if status not in {StepStatus.COMPLETED, StepStatus.FAILED}:
+            self._record(
+                "rejected",
+                token,
+                reason="non_terminal_status",
+                current_status=workflow.status,
+            )
+            return False
+        if token.revision != workflow.revision:
+            self._record(
+                "rejected",
+                token,
+                reason="stale_revision",
+                current_status=workflow.status,
+            )
+            return False
+        if workflow.status in {StepStatus.COMPLETED, StepStatus.FAILED}:
+            if (
+                workflow.finalized_attempt == token.attempt
+                and workflow.status == status
+            ):
+                self._record(
+                    "accepted",
+                    token,
+                    reason="duplicate_terminal_event",
+                    current_status=workflow.status,
+                )
+                return True
+            self._record(
+                "rejected",
+                token,
+                reason="terminal_conflict",
+                current_status=workflow.status,
+            )
+            return False
+
+        workflow.status = status
+        workflow.finalized_attempt = token.attempt
+        workflow.revision += 1
+        self._record(
+            "accepted",
+            token,
+            reason="finalized",
+            current_status=workflow.status,
+        )
         return True
+
+    def _record(
+        self,
+        decision: str,
+        token: WorkflowFinalizationToken,
+        *,
+        reason: str,
+        current_status: StepStatus,
+    ) -> None:
+        self.audit_records.append(
+            {
+                "decision": decision,
+                "workflow_id": token.workflow_id,
+                "attempt": token.attempt,
+                "revision": token.revision,
+                "reason": reason,
+                "current_status": current_status.value,
+            }
+        )
 
 # 2019-03-27T19:58:07 update
 
