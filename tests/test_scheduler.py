@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,67 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_future_scheduled_task_does_not_block_immediate_lane(self):
+        scheduled_id = self.scheduler.schedule(
+            {"type": "scheduled", "payload": {"secret": "do-not-audit"}},
+            delay=60,
+        )
+        immediate_id = self.scheduler.enqueue({"type": "immediate"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == immediate_id
+        assert task["type"] == "immediate"
+        assert task["lane"] == "immediate"
+        assert task["id"] != scheduled_id
+        assert any(
+            record["decision"] == "deferred"
+            and record["task_id"] == scheduled_id
+            for record in self.scheduler.audit_records()
+        )
+
+    def test_due_scheduled_task_promotes_with_original_identity(self):
+        task_id = self.scheduler.schedule({"type": "scheduled"}, delay=0)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["type"] == "scheduled"
+        assert task["lane"] == "scheduled"
+        assert any(
+            record["decision"] == "promoted"
+            and record["task_id"] == task_id
+            for record in self.scheduler.audit_records()
+        )
+
+    def test_retry_preserves_task_identity_and_lane(self):
+        task_id = self.scheduler.enqueue({"type": "retry"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        retry = asyncio.run(self.scheduler.dequeue())
+
+        assert retry["id"] == task_id
+        assert retry["lane"] == "immediate"
+        assert retry["retries"] == 1
+
+    def test_scheduler_audit_records_do_not_expose_payloads(self):
+        self.scheduler.schedule(
+            {"type": "scheduled", "payload": {"token": "secret"}},
+            delay=60,
+        )
+
+        import asyncio
+        asyncio.run(self.scheduler.dequeue())
+
+        audit_text = repr(self.scheduler.audit_records())
+        assert "payload" not in audit_text
+        assert "secret" not in audit_text
 
 # 2019-01-09T19:07:03 update
 
