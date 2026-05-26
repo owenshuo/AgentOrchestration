@@ -23,8 +23,20 @@ class Config:
                 config_key = key[len(prefix):].lower().replace("_", ".")
                 self._set_nested(config_key, value)
 
-    def _set_nested(self, key: str, value: Any) -> None:
+    @staticmethod
+    def _validate_key(key: str) -> list[str]:
+        if not isinstance(key, str):
+            raise ValueError("Config key must be a string")
+
         parts = key.split(".")
+        if not key or any(part == "" for part in parts):
+            raise ValueError(
+                "Config key must not contain empty path segments"
+            )
+        return parts
+
+    def _set_nested(self, key: str, value: Any) -> None:
+        parts = self._validate_key(key)
         current = self._data
         for part in parts[:-1]:
             if part not in current:
@@ -33,7 +45,7 @@ class Config:
         current[parts[-1]] = value
 
     def get(self, key: str, default: Any = None) -> Any:
-        parts = key.split(".")
+        parts = self._validate_key(key)
         current = self._data
         for part in parts:
             if isinstance(current, dict):
