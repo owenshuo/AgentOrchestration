@@ -117,6 +117,57 @@ class TestAgentRegistry:
 
         assert self.registry.resolve_handlers("worker.analytics") == []
 
+    def test_stopped_dependency_invalidates_cached_handler_resolution(self):
+        storage_id = self.registry.register(
+            "storage-plugin",
+            "plugin.storage",
+            config={"plugin_name": "storage", "plugin_version": "2.1.0"},
+        )
+        self.registry.register(
+            "analytics-plugin",
+            "worker.analytics",
+            config={
+                "plugin_name": "analytics",
+                "plugin_version": "1.0.0",
+                "plugin_dependencies": {"storage": ">=2.0.0,<3.0.0"},
+            },
+        )
+        assert len(self.registry.resolve_handlers("worker.analytics")) == 1
+
+        assert self.registry.update_status(storage_id, AgentStatus.STOPPED)
+
+        assert self.registry.resolve_handlers("worker.analytics") == []
+        assert any(
+            record["event"] == "plugin_resolution_cache_invalidated"
+            and record["reason"] == "status_changed"
+            for record in self.registry.audit_records
+        )
+
+    def test_stopped_handler_is_deferred_during_resolution(self):
+        self.registry.register(
+            "runtime-plugin",
+            "plugin.runtime",
+            config={"plugin_name": "runtime", "plugin_version": "1.0.0"},
+        )
+        handler_id = self.registry.register(
+            "worker-plugin",
+            "worker.processor",
+            config={
+                "plugin_name": "processor",
+                "plugin_version": "1.0.0",
+                "plugin_dependencies": {"runtime": ">=1.0.0,<2.0.0"},
+            },
+        )
+        assert self.registry.update_status(handler_id, AgentStatus.STOPPED)
+
+        assert self.registry.resolve_handlers("worker.processor") == []
+        assert any(
+            record["event"] == "plugin_dependency_resolution"
+            and record["decision"] == "deferred"
+            and record["reason"] == "handler_not_active"
+            for record in self.registry.audit_records
+        )
+
     def test_resolve_handlers_filters_required_plugin_versions(self):
         self.registry.register(
             "runtime-plugin",

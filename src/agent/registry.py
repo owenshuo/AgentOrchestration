@@ -232,11 +232,7 @@ class AgentRegistry:
         agent: Dict[str, Any],
         required_plugins: Dict[str, str],
     ) -> bool:
-        terminal_statuses = {
-            AgentStatus.FAILED.value,
-            AgentStatus.TERMINATED.value,
-        }
-        if agent["status"] in terminal_statuses:
+        if self._plugin_is_unavailable(agent):
             self._record_audit(
                 "plugin_dependency_resolution",
                 "deferred",
@@ -269,16 +265,21 @@ class AgentRegistry:
             agent = self._agents.get(agent_id)
             if not agent:
                 continue
-            terminal_statuses = {
-                AgentStatus.FAILED.value,
-                AgentStatus.TERMINATED.value,
-            }
-            if agent["status"] in terminal_statuses:
+            if self._plugin_is_unavailable(agent):
                 continue
             version = agent["plugin"]["version"]
             if self._version_satisfies(version, constraint):
                 return True
         return False
+
+    def _plugin_is_unavailable(self, agent: Dict[str, Any]) -> bool:
+        unavailable_statuses = {
+            AgentStatus.PAUSED.value,
+            AgentStatus.STOPPED.value,
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }
+        return agent["status"] in unavailable_statuses
 
     def _validate_constraint(self, constraint: str) -> None:
         for part in constraint.split(","):
