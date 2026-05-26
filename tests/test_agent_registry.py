@@ -48,6 +48,109 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_register_rejects_incompatible_plugin_dependency_version(self):
+        self.registry.register(
+            "storage-plugin",
+            "plugin.storage",
+            config={"plugin_name": "storage", "plugin_version": "1.5.0"},
+        )
+
+        with pytest.raises(ValueError, match="dependency versions"):
+            self.registry.register(
+                "analytics-plugin",
+                "worker.analytics",
+                config={
+                    "plugin_name": "analytics",
+                    "plugin_version": "2.0.0",
+                    "plugin_dependencies": {"storage": ">=2.0.0,<3.0.0"},
+                    "secret": "must-not-appear-in-audit",
+                },
+            )
+
+        assert self.registry.count() == 1
+        rejected = self.registry.audit_records[-1]
+        assert rejected["decision"] == "rejected"
+        assert rejected["missing_dependencies"] == ["storage"]
+        assert "must-not-appear-in-audit" not in str(rejected)
+
+    def test_resolve_handlers_requires_satisfied_plugin_dependencies(self):
+        storage_id = self.registry.register(
+            "storage-plugin",
+            "plugin.storage",
+            config={"plugin_name": "storage", "plugin_version": "2.1.0"},
+        )
+        handler_id = self.registry.register(
+            "analytics-plugin",
+            "worker.analytics",
+            config={
+                "plugin_name": "analytics",
+                "plugin_version": "1.0.0",
+                "plugin_dependencies": {"storage": ">=2.0.0,<3.0.0"},
+            },
+        )
+
+        handlers = self.registry.resolve_handlers("worker.analytics")
+
+        assert [handler["id"] for handler in handlers] == [handler_id]
+
+        assert self.registry.delete(storage_id)
+        assert self.registry.resolve_handlers("worker.analytics") == []
+
+    def test_dependency_resolution_cache_invalidates_on_status_change(self):
+        storage_id = self.registry.register(
+            "storage-plugin",
+            "plugin.storage",
+            config={"plugin_name": "storage", "plugin_version": "2.1.0"},
+        )
+        self.registry.register(
+            "analytics-plugin",
+            "worker.analytics",
+            config={
+                "plugin_name": "analytics",
+                "plugin_version": "1.0.0",
+                "plugin_dependencies": {"storage": ">=2.0.0,<3.0.0"},
+            },
+        )
+        assert len(self.registry.resolve_handlers("worker.analytics")) == 1
+
+        assert self.registry.update_status(storage_id, AgentStatus.TERMINATED)
+
+        assert self.registry.resolve_handlers("worker.analytics") == []
+
+    def test_resolve_handlers_filters_required_plugin_versions(self):
+        self.registry.register(
+            "runtime-plugin",
+            "plugin.runtime",
+            config={"plugin_name": "runtime", "plugin_version": "1.2.0"},
+        )
+        handler_id = self.registry.register(
+            "worker-plugin",
+            "worker.processor",
+            config={"plugin_name": "processor", "plugin_version": "1.0.0"},
+        )
+
+        compatible = self.registry.resolve_handlers(
+            "worker.processor",
+            required_plugins={"runtime": ">=1.0.0,<2.0.0"},
+        )
+        incompatible = self.registry.resolve_handlers(
+            "worker.processor",
+            required_plugins={"runtime": ">=2.0.0,<3.0.0"},
+        )
+
+        assert [handler["id"] for handler in compatible] == [handler_id]
+        assert incompatible == []
+
+    def test_invalid_plugin_version_is_rejected_before_registration(self):
+        with pytest.raises(ValueError, match="major.minor.patch"):
+            self.registry.register(
+                "bad-plugin",
+                "worker.bad",
+                config={"plugin_name": "bad", "plugin_version": "1.0"},
+            )
+
+        assert self.registry.count() == 0
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update

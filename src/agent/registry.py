@@ -1,10 +1,9 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class AgentStatus(Enum):
@@ -21,8 +20,28 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._plugin_index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[
+            Tuple[str, Tuple[Tuple[str, str], ...]],
+            List[str],
+        ] = {}
+        self.audit_records: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        config = config or {}
+        plugin_config = self._normalize_plugin_config(agent_type, config)
+        plugin_name, plugin_version, dependencies = plugin_config
+        self._validate_plugin_dependencies(
+            plugin_name,
+            plugin_version,
+            dependencies,
+        )
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,22 +49,39 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
+            "plugin": {
+                "name": plugin_name,
+                "version": plugin_version,
+                "dependencies": dependencies,
+            },
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._plugin_index.setdefault(plugin_name, []).append(agent_id)
+        self._invalidate_resolution_cache("plugin_registered", plugin_name)
+        self._record_audit(
+            "plugin_registered",
+            "accepted",
+            plugin_name=plugin_name,
+            plugin_version=plugin_version,
+        )
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,6 +95,7 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_resolution_cache("status_changed", agent_id)
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +105,245 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        plugin_name = agent["plugin"]["name"]
+        if (
+            plugin_name in self._plugin_index
+            and agent_id in self._plugin_index[plugin_name]
+        ):
+            self._plugin_index[plugin_name].remove(agent_id)
+        self._invalidate_resolution_cache("plugin_deleted", plugin_name)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def resolve_handlers(
+        self,
+        agent_type: str,
+        required_plugins: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        dependencies = self._normalize_dependencies(required_plugins or {})
+        cache_key = (agent_type, tuple(sorted(dependencies.items())))
+        cached_ids = self._resolution_cache.get(cache_key)
+        if cached_ids is not None:
+            return [
+                self._agents[agent_id]
+                for agent_id in cached_ids
+                if agent_id in self._agents
+            ]
+
+        handlers = []
+        for agent in self._agents.values():
+            if agent["type"] != agent_type:
+                continue
+            if not self._agent_can_resolve(agent, dependencies):
+                continue
+            handlers.append(agent)
+
+        self._resolution_cache[cache_key] = [agent["id"] for agent in handlers]
+        self._record_audit(
+            "plugin_dependency_resolution",
+            "accepted",
+            agent_type=agent_type,
+            handler_count=len(handlers),
+        )
+        return list(handlers)
+
+    def _normalize_plugin_config(
+        self,
+        agent_type: str,
+        config: Dict[str, Any],
+    ) -> Tuple[str, str, Dict[str, str]]:
+        plugin = config.get("plugin") or {}
+        plugin_name = (
+            config.get("plugin_name")
+            or plugin.get("name")
+            or agent_type
+        )
+        plugin_version = (
+            config.get("plugin_version")
+            or plugin.get("version")
+            or "1.0.0"
+        )
+        dependencies = (
+            config.get("plugin_dependencies")
+            or config.get("dependencies")
+            or plugin.get("dependencies")
+            or {}
+        )
+        if not isinstance(plugin_name, str) or not plugin_name.strip():
+            raise ValueError("plugin name is required")
+        if not isinstance(plugin_version, str) or not plugin_version.strip():
+            raise ValueError("plugin version is required")
+        self._parse_version(plugin_version)
+        return (
+            plugin_name.strip(),
+            plugin_version.strip(),
+            self._normalize_dependencies(dependencies),
+        )
+
+    def _normalize_dependencies(self, dependencies: Any) -> Dict[str, str]:
+        if isinstance(dependencies, dict):
+            items = dependencies.items()
+        elif isinstance(dependencies, list):
+            items = [
+                (dep.get("name"), dep.get("version"))
+                for dep in dependencies
+                if isinstance(dep, dict)
+            ]
+        else:
+            raise ValueError("plugin dependencies must be a mapping or list")
+
+        normalized: Dict[str, str] = {}
+        for name, constraint in items:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("dependency name is required")
+            if not isinstance(constraint, str) or not constraint.strip():
+                raise ValueError("dependency version constraint is required")
+            self._validate_constraint(constraint)
+            normalized[name.strip()] = constraint.strip()
+        return normalized
+
+    def _validate_plugin_dependencies(
+        self,
+        plugin_name: str,
+        plugin_version: str,
+        dependencies: Dict[str, str],
+    ) -> None:
+        missing = [
+            name
+            for name, constraint in dependencies.items()
+            if not self._dependency_is_satisfied(name, constraint)
+        ]
+        if not missing:
+            return
+
+        self._record_audit(
+            "plugin_dependency_resolution",
+            "rejected",
+            plugin_name=plugin_name,
+            plugin_version=plugin_version,
+            missing_dependencies=missing,
+        )
+        raise ValueError("plugin dependency versions are not satisfied")
+
+    def _agent_can_resolve(
+        self,
+        agent: Dict[str, Any],
+        required_plugins: Dict[str, str],
+    ) -> bool:
+        terminal_statuses = {
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }
+        if agent["status"] in terminal_statuses:
+            self._record_audit(
+                "plugin_dependency_resolution",
+                "deferred",
+                agent_id=agent["id"],
+                reason="handler_not_active",
+            )
+            return False
+
+        plugin = agent["plugin"]
+        dependencies = dict(plugin["dependencies"])
+        dependencies.update(required_plugins)
+        missing = [
+            name
+            for name, constraint in dependencies.items()
+            if not self._dependency_is_satisfied(name, constraint)
+        ]
+        if not missing:
+            return True
+
+        self._record_audit(
+            "plugin_dependency_resolution",
+            "deferred",
+            agent_id=agent["id"],
+            missing_dependencies=missing,
+        )
+        return False
+
+    def _dependency_is_satisfied(self, name: str, constraint: str) -> bool:
+        for agent_id in self._plugin_index.get(name, []):
+            agent = self._agents.get(agent_id)
+            if not agent:
+                continue
+            terminal_statuses = {
+                AgentStatus.FAILED.value,
+                AgentStatus.TERMINATED.value,
+            }
+            if agent["status"] in terminal_statuses:
+                continue
+            version = agent["plugin"]["version"]
+            if self._version_satisfies(version, constraint):
+                return True
+        return False
+
+    def _validate_constraint(self, constraint: str) -> None:
+        for part in constraint.split(","):
+            self._parse_constraint_part(part.strip())
+
+    def _version_satisfies(self, version: str, constraint: str) -> bool:
+        parsed_version = self._parse_version(version)
+        for part in constraint.split(","):
+            operator, expected = self._parse_constraint_part(part.strip())
+            parsed_expected = self._parse_version(expected)
+            if operator == "==" and parsed_version != parsed_expected:
+                return False
+            if operator == ">=" and parsed_version < parsed_expected:
+                return False
+            if operator == ">" and parsed_version <= parsed_expected:
+                return False
+            if operator == "<=" and parsed_version > parsed_expected:
+                return False
+            if operator == "<" and parsed_version >= parsed_expected:
+                return False
+        return True
+
+    def _parse_constraint_part(self, part: str) -> Tuple[str, str]:
+        for operator in (">=", "<=", "==", ">", "<"):
+            if part.startswith(operator):
+                version = part[len(operator):].strip()
+                self._parse_version(version)
+                return operator, version
+        self._parse_version(part)
+        return "==", part
+
+    def _parse_version(self, version: str) -> Tuple[int, int, int]:
+        parts = version.split(".")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            raise ValueError("plugin versions must use major.minor.patch")
+        return int(parts[0]), int(parts[1]), int(parts[2])
+
+    def _invalidate_resolution_cache(self, reason: str, subject: str) -> None:
+        self._resolution_cache.clear()
+        self._record_audit(
+            "plugin_resolution_cache_invalidated",
+            "accepted",
+            reason=reason,
+            subject=subject,
+        )
+
+    def _record_audit(
+        self,
+        event: str,
+        decision: str,
+        **fields: Any,
+    ) -> None:
+        safe_fields = {
+            key: value
+            for key, value in fields.items()
+            if key not in {"config", "env", "payload", "secret", "token"}
+        }
+        self.audit_records.append(
+            {
+                "event": event,
+                "decision": decision,
+                "timestamp": time.time(),
+                **safe_fields,
+            }
+        )
 
 # 2019-01-29T11:24:49 update
 
