@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
 
@@ -31,36 +30,74 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._clock = clock
+        self._wall_clock = wall_clock
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._wall_clock()
+        task["queued_at_monotonic"] = self._clock()
         task["retries"] = 0
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        if delay < 0:
+            raise ValueError("delay must be non-negative")
+
         task_id = str(uuid4())
+        scheduled_at_monotonic = self._clock()
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["scheduled_at"] = self._wall_clock()
+        task["scheduled_at_monotonic"] = scheduled_at_monotonic
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "ready_at": scheduled_at_monotonic + delay,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            tid
+            for tid, scheduled in self._scheduled.items()
+            if scheduled["queue"] == queue and scheduled["ready_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            task = scheduled["task"]
+            self._enqueue_existing_task(task, queue, scheduled["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -77,9 +114,26 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._enqueue_existing_task(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
                 return True
         return False
+
+    def _enqueue_existing_task(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int = 0,
+    ) -> None:
+        task["enqueued_at"] = self._wall_clock()
+        task["queued_at_monotonic"] = self._clock()
+        task["priority"] = priority
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
 
 # 2019-04-25T08:37:12 update
 

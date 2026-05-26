@@ -2,6 +2,17 @@ import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
+class ManualClock:
+    def __init__(self, value=0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
 class TestTaskScheduler:
     def setup_method(self):
         self.scheduler = TaskScheduler()
@@ -35,6 +46,30 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_survives_wall_clock_rollback(self):
+        monotonic = ManualClock(100)
+        wall_clock = ManualClock(1000)
+        scheduler = TaskScheduler(clock=monotonic, wall_clock=wall_clock)
+        scheduler.schedule({"type": "heartbeat"}, delay=30)
+
+        wall_clock.advance(-3600)
+        monotonic.advance(29)
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        monotonic.advance(1)
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["type"] == "heartbeat"
+        assert task["enqueued_at"] == -2600
+        assert task["queued_at_monotonic"] == 130
+
+    def test_schedule_rejects_negative_delay(self):
+        with pytest.raises(ValueError, match="delay must be non-negative"):
+            self.scheduler.schedule({"type": "heartbeat"}, delay=-1)
 
 # 2019-01-09T19:07:03 update
 
