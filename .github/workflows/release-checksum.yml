@@ -1,0 +1,47 @@
+name: Release checksum
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, develop]
+
+jobs:
+  release-checksum:
+    name: Release checksum (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build normalized release archive
+        shell: bash
+        run: |
+          python scripts/release_archive.py \
+            --output dist/agent-orchestrator-release.tar.gz
+      - name: Verify checksum policy
+        shell: bash
+        run: |
+          test -s dist/agent-orchestrator-release.tar.gz.sha256
+          python - <<'PY'
+          import json
+          import tarfile
+
+          with tarfile.open("dist/agent-orchestrator-release.tar.gz", "r:gz") as archive:
+              manifest = json.loads(archive.extractfile("RELEASE-LINE-ENDINGS.json").read())
+
+          assert manifest["line_ending_policy"] == "text files are normalized to LF before hashing"
+          assert all(entry["line_endings"] in {"LF", "binary"} for entry in manifest["entries"])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checksum-${{ matrix.os }}
+          path: |
+            dist/agent-orchestrator-release.tar.gz
+            dist/agent-orchestrator-release.tar.gz.sha256
