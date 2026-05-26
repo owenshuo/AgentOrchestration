@@ -129,6 +129,35 @@ class TestTaskScheduler:
         assert not self.scheduler.fail(task_id)
         assert not self.scheduler.fail(task_id)
 
+    def test_state_report_summarizes_without_task_payloads(self):
+        task_id = self.scheduler.schedule(
+            {
+                "type": "nightly",
+                "schedule_key": "nightly:2026-05-26",
+                "payload": {"secret": "do-not-report"},
+            },
+            delay=0,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        report = self.scheduler.state_report()
+
+        assert task["id"] == task_id
+        assert report == {
+            "queues": {"default": 0},
+            "scheduled": 0,
+            "scheduled_run_keys": 1,
+            "queued": 0,
+            "in_flight": 1,
+            "terminal": 0,
+        }
+        assert "payload" not in str(report)
+        assert "do-not-report" not in str(report)
+
+        assert self.scheduler.complete(task_id)
+        assert self.scheduler.state_report()["terminal"] == 1
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

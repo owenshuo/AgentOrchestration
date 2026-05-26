@@ -143,6 +143,19 @@ class TaskScheduler:
             self._terminal_task_ids.add(task_id)
         return False
 
+    def state_report(self) -> Dict[str, Any]:
+        return {
+            "queues": {
+                queue: len(tasks)
+                for queue, tasks in sorted(self._queues.items())
+            },
+            "scheduled": len(self._scheduled),
+            "scheduled_run_keys": len(self._scheduled_run_keys),
+            "queued": len(self._queued_task_ids),
+            "in_flight": len(self._in_flight),
+            "terminal": len(self._terminal_task_ids),
+        }
+
 # 2019-04-25T08:37:12 update
 
 # 2019-06-04T16:40:00 update
