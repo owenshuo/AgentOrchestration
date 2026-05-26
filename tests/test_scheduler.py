@@ -111,6 +111,35 @@ class TestTaskScheduler:
         assert "payload" not in records[-1]
         assert "token" not in repr(records)
 
+    def test_fairness_stats_report_class_capacity_without_payloads(self):
+        scheduler = TaskScheduler(priority_budgets={"urgent": 1})
+        scheduler.enqueue(
+            {
+                "type": "urgent-1",
+                "priority_class": "urgent",
+                "payload": {"token": "do-not-record"},
+            },
+            priority=10,
+        )
+        scheduler.enqueue(
+            {"type": "urgent-2", "priority_class": "urgent"},
+            priority=10,
+        )
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        stats = scheduler.fairness_stats()
+
+        assert task["type"] == "urgent-1"
+        assert stats["budgets"]["urgent"] == 1
+        assert stats["in_flight"]["urgent"] == 1
+        assert stats["queued"]["urgent"] == 1
+        assert stats["available"]["urgent"] == 0
+        assert "token" not in repr(stats)
+
+        assert scheduler.complete(task["id"])
+        assert scheduler.fairness_stats()["available"]["urgent"] == 1
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

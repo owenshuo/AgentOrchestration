@@ -34,6 +34,9 @@ class PriorityQueue:
             heapq.heappush(self._queue, entry)
         return matched
 
+    def items(self) -> List[Any]:
+        return [entry[2] for entry in self._queue]
+
     def peek(self) -> Optional[Any]:
         if self._queue:
             return self._queue[0][2]
@@ -154,6 +157,37 @@ class TaskScheduler:
 
     def audit_records(self) -> List[Dict[str, Any]]:
         return list(self._audit)
+
+    def fairness_stats(self) -> Dict[str, Any]:
+        in_flight = dict(self._in_flight_counts())
+        queued: Counter = Counter()
+        for task_queue in self._queues.values():
+            queued.update(
+                task.get("priority_class", "default")
+                for task in task_queue.items()
+            )
+        priority_classes = (
+            set(self._priority_budgets)
+            | set(in_flight)
+            | set(queued)
+        )
+        available = {}
+        for priority_class in priority_classes:
+            budget = self._priority_budgets.get(priority_class)
+            if budget is None:
+                available[priority_class] = None
+            else:
+                available[priority_class] = max(
+                    budget - in_flight.get(priority_class, 0),
+                    0,
+                )
+        return {
+            "budgets": dict(self._priority_budgets),
+            "in_flight": in_flight,
+            "queued": dict(queued),
+            "available": available,
+            "recent_decisions": self.audit_records(),
+        }
 
     def _priority_class(self, task: Dict, priority: int) -> str:
         if task.get("priority_class"):
