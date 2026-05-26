@@ -66,6 +66,53 @@ def test_reconciliation_reports_and_removes_orphan_derived_records():
     assert store.derived_index_ids() == []
 
 
+def test_retention_report_previews_cleanup_without_payload_metadata():
+    clock = ManualClock()
+    store = ArtifactIndexStore(clock=clock)
+    store.put_artifact(
+        "expired",
+        {"body": "private-source"},
+        retention_seconds=5,
+    )
+    store.put_derived_index(
+        "idx-expired",
+        "expired",
+        {"terms": ["private-index"]},
+    )
+    store.put_artifact("kept", {"body": "public"}, retention_seconds=30)
+    store.put_derived_index("idx-orphan", "kept", {"terms": ["orphaned"]})
+
+    store._artifacts.pop("kept")
+    clock.advance(5)
+
+    report = store.retention_report()
+
+    assert report == {
+        "expired_artifacts": ["expired"],
+        "stale_derived_indexes": ["idx-orphan"],
+        "counts": {
+            "artifacts": 1,
+            "derived_indexes": 2,
+            "expired_artifacts": 1,
+            "stale_derived_indexes": 1,
+        },
+    }
+    assert store.artifact_ids() == ["expired"]
+    assert store.derived_index_ids() == ["idx-expired", "idx-orphan"]
+    assert "private-source" not in str(report)
+    assert "private-index" not in str(report)
+    assert "orphaned" not in str(report)
+
+    cleanup_report = store.reconcile_retention()
+
+    assert cleanup_report == {
+        "expired_artifacts": ["expired"],
+        "stale_derived_indexes": ["idx-orphan"],
+    }
+    assert store.artifact_ids() == []
+    assert store.derived_index_ids() == []
+
+
 def test_reindexing_moves_derived_record_between_artifacts():
     store = ArtifactIndexStore()
     store.put_artifact("artifact-1", {"body": "first"})

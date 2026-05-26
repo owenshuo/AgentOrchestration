@@ -104,22 +104,45 @@ class ArtifactIndexStore:
 
     def reconcile_retention(self) -> Dict[str, List[str]]:
         """Remove expired artifacts and orphaned derived indexes."""
-        expired_artifacts: List[str] = []
-        stale_derived_indexes: List[str] = []
+        report = self.retention_report()
+        expired_artifacts = list(report["expired_artifacts"])
+        stale_derived_indexes = list(report["stale_derived_indexes"])
 
-        for artifact_id, record in list(self._artifacts.items()):
-            if self._is_expired(record):
-                expired_artifacts.append(artifact_id)
-                self.delete_artifact(artifact_id)
+        for artifact_id in expired_artifacts:
+            self.delete_artifact(artifact_id)
 
-        for index_id, record in list(self._derived_indexes.items()):
-            if record.artifact_id not in self._artifacts:
-                stale_derived_indexes.append(index_id)
-                self._derived_indexes.pop(index_id, None)
+        for index_id in stale_derived_indexes:
+            self._derived_indexes.pop(index_id, None)
 
         return {
             "expired_artifacts": expired_artifacts,
             "stale_derived_indexes": stale_derived_indexes,
+        }
+
+    def retention_report(self) -> Dict[str, Any]:
+        """Preview retention cleanup without exposing stored payloads."""
+        expired_artifacts = [
+            artifact_id
+            for artifact_id, record in self._artifacts.items()
+            if self._is_expired(record)
+        ]
+        stale_derived_indexes = [
+            index_id
+            for index_id, record in self._derived_indexes.items()
+            if record.artifact_id not in self._artifacts
+        ]
+
+        expired_artifacts.sort()
+        stale_derived_indexes.sort()
+        return {
+            "expired_artifacts": expired_artifacts,
+            "stale_derived_indexes": stale_derived_indexes,
+            "counts": {
+                "artifacts": len(self._artifacts),
+                "derived_indexes": len(self._derived_indexes),
+                "expired_artifacts": len(expired_artifacts),
+                "stale_derived_indexes": len(stale_derived_indexes),
+            },
         }
 
     def artifact_ids(self) -> List[str]:
