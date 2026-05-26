@@ -47,6 +47,26 @@ class ServiceAccountProvisioner:
         account = self._accounts.get(account_id)
         return dict(account) if account else None
 
+    def get_by_external_id(
+        self,
+        organization_id: str,
+        external_id: str,
+        include_disabled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        normalized = self._normalize_external_id(external_id)
+        for account in self._accounts.values():
+            if account["organization_id"] != organization_id:
+                continue
+            if account["external_id"] != normalized:
+                continue
+            if (
+                account["status"] == ServiceAccountStatus.DISABLED.value
+                and not include_disabled
+            ):
+                continue
+            return dict(account)
+        return None
+
     def update(
         self,
         account_id: str,
@@ -145,7 +165,7 @@ class ServiceAccountProvisioner:
         if external_id is None:
             return None
         normalized = external_id.strip()
-        return normalized or None
+        return normalized.casefold() or None
 
     @staticmethod
     def _external_id_key(organization_id: str, external_id: str) -> str:

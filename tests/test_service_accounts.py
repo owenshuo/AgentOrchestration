@@ -5,7 +5,7 @@ from src.identity.service_accounts import ServiceAccountProvisioner
 
 def test_create_rejects_duplicate_active_external_id_in_organization():
     provisioner = ServiceAccountProvisioner()
-    provisioner.create("org-a", "deploy", external_id="idp-123")
+    provisioner.create("org-a", "deploy", external_id=" IDP-123 ")
 
     with pytest.raises(ValueError, match="external_id must be unique"):
         provisioner.create("org-a", "rotate", external_id="idp-123")
@@ -17,6 +17,18 @@ def test_create_allows_same_external_id_in_different_organizations():
     second = provisioner.create("org-b", "deploy", external_id="idp-123")
 
     assert first != second
+
+
+def test_lookup_by_external_id_is_scoped_and_normalized():
+    provisioner = ServiceAccountProvisioner()
+    account_id = provisioner.create("org-a", "deploy", external_id=" IDP-123 ")
+    provisioner.create("org-b", "deploy", external_id="idp-123")
+
+    account = provisioner.get_by_external_id("org-a", "idp-123")
+
+    assert account["id"] == account_id
+    assert account["external_id"] == "idp-123"
+    assert provisioner.get_by_external_id("org-c", "idp-123") is None
 
 
 def test_update_rejects_duplicate_active_external_id():
@@ -41,6 +53,15 @@ def test_disabled_accounts_do_not_block_external_id_reuse():
 
     assert provisioner.get(disabled)["status"] == "disabled"
     assert provisioner.get(active)["status"] == "active"
+    assert provisioner.get_by_external_id("org-a", "idp-123")["id"] == active
+    assert (
+        provisioner.get_by_external_id(
+            "org-a",
+            "idp-123",
+            include_disabled=True,
+        )["id"]
+        == disabled
+    )
 
 
 def test_restore_rechecks_external_id_uniqueness():
