@@ -1,22 +1,34 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Header, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.idempotency import (
+    DestructiveActionIdempotencyStore,
+    IdempotencyConflictError,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+destructive_idempotency = DestructiveActionIdempotencyStore()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -30,10 +42,31 @@ async def get_agent(agent_id: str):
 
 
 @router.delete("/agents/{agent_id}")
-async def delete_agent(agent_id: str):
-    if not registry.delete(agent_id):
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return {"status": "deleted"}
+async def delete_agent(
+    agent_id: str,
+    idempotency_key: Optional[str] = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+):
+    if not isinstance(idempotency_key, str):
+        idempotency_key = None
+    fingerprint = f"DELETE:/agents/{agent_id}"
+
+    def do_delete() -> Dict[str, str]:
+        if not registry.delete(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"status": "deleted", "agent_id": agent_id}
+
+    try:
+        response, _ = destructive_idempotency.execute(
+            idempotency_key,
+            fingerprint,
+            do_delete,
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return response
 
 
 @router.post("/agents/{agent_id}/start")
