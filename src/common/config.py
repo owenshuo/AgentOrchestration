@@ -20,14 +20,20 @@ class Config:
         suffix = config_path.suffix.lower()
 
         with config_path.open() as f:
-            if suffix == ".json":
-                data = json.load(f)
-            elif suffix in {".yaml", ".yml"}:
-                data = yaml.safe_load(f)
-            else:
-                raise ValueError(
-                    "Unsupported config format. Use .json, .yaml, or .yml"
-                )
+            try:
+                if suffix == ".json":
+                    data = json.load(f)
+                elif suffix in {".yaml", ".yml"}:
+                    data = yaml.safe_load(f)
+                else:
+                    raise ValueError(
+                        "Unsupported config format. "
+                        "Use .json, .yaml, or .yml"
+                    )
+            except json.JSONDecodeError as error:
+                raise ValueError("Invalid JSON config") from error
+            except yaml.YAMLError as error:
+                raise ValueError("Invalid YAML config") from error
 
         if data is None:
             data = {}

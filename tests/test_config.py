@@ -48,6 +48,20 @@ class TestConfig:
         with pytest.raises(ValueError, match="Config root must be a mapping"):
             Config(str(config_file))
 
+    def test_rejects_malformed_yaml_with_clear_error(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("app:\n  name: broken\n    port: 8080\n")
+
+        with pytest.raises(ValueError, match="Invalid YAML config"):
+            Config(str(config_file))
+
+    def test_rejects_malformed_json_with_clear_error(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"app": {"name": "broken",}')
+
+        with pytest.raises(ValueError, match="Invalid JSON config"):
+            Config(str(config_file))
+
     def test_default_value(self):
         config = Config()
         assert config.get("nonexistent.key", "default") == "default"
