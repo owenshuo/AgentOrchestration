@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 
 class AuthDecision(str, Enum):
@@ -51,6 +52,27 @@ class CollaborationAuthService:
 
     _SHARE_ROLES = {WorkspaceRole.MEMBER, WorkspaceRole.ADMIN}
 
+    def __init__(self) -> None:
+        self._audit_events: List[Dict[str, str]] = []
+
+    @property
+    def audit_events(self) -> List[Dict[str, str]]:
+        return [dict(event) for event in self._audit_events]
+
+    def audit_report(self) -> Dict[str, Any]:
+        events = self.audit_events
+        return {
+            "total": len(events),
+            "allowed": sum(
+                1 for event in events if event["decision"] == "allow"
+            ),
+            "denied": sum(
+                1 for event in events if event["decision"] == "deny"
+            ),
+            "by_reason": dict(Counter(event["reason"] for event in events)),
+            "recent": events,
+        }
+
     def authorize_saved_view_share(
         self,
         principal: Optional[Principal],
@@ -74,11 +96,13 @@ class CollaborationAuthService:
                 principal,
                 request,
             )
-        return AuthorizationResult(
+        result = AuthorizationResult(
             decision=AuthDecision.ALLOW,
             reason="authorized",
             audit=self._audit("allow", "authorized", principal, request),
         )
+        self._audit_events.append(dict(result.audit))
+        return result
 
     @staticmethod
     def _has_any_role(
@@ -93,11 +117,13 @@ class CollaborationAuthService:
         principal: Optional[Principal],
         request: SavedViewShareRequest,
     ) -> AuthorizationResult:
-        return AuthorizationResult(
+        result = AuthorizationResult(
             decision=AuthDecision.DENY,
             reason=reason,
             audit=self._audit("deny", reason, principal, request),
         )
+        self._audit_events.append(dict(result.audit))
+        return result
 
     @staticmethod
     def _audit(

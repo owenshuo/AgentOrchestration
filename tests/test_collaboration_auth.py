@@ -100,3 +100,42 @@ def test_saved_view_share_audit_does_not_expose_target_or_roles(
 
     assert "target_principal_id" not in result.audit
     assert "roles" not in result.audit
+
+
+def test_saved_view_share_audit_report_summarizes_without_private_data(
+    share_request,
+):
+    service = CollaborationAuthService()
+
+    service.authorize_saved_view_share(
+        principal(id="user-owner", roles={WorkspaceRole.ADMIN}),
+        share_request,
+    )
+    service.authorize_saved_view_share(
+        principal(id="user-limited", roles={WorkspaceRole.VIEWER}),
+        share_request,
+    )
+    service.authorize_saved_view_share(
+        principal(id="user-other", workspace_id="workspace-2"),
+        share_request,
+    )
+
+    report = service.audit_report()
+
+    assert report["total"] == 3
+    assert report["allowed"] == 1
+    assert report["denied"] == 2
+    assert report["by_reason"] == {
+        "authorized": 1,
+        "insufficient_workspace_role": 1,
+        "workspace_membership_required": 1,
+    }
+    assert len(report["recent"]) == 3
+    assert "target_principal_id" not in str(report)
+    assert "user-2" not in str(report)
+    assert "roles" not in str(report)
+    assert "viewer" not in str(report)
+    assert "admin" not in str(report).lower()
+
+    report["recent"][0]["reason"] = "changed"
+    assert service.audit_events[0]["reason"] == "authorized"
