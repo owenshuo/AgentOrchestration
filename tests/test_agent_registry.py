@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +46,99 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_resolve_handlers_filters_by_data_locality(self):
+        us_agent_id = self.registry.register(
+            "us-agent",
+            "worker.processor",
+            {"data_locality": "us-east"},
+        )
+        eu_agent_id = self.registry.register(
+            "eu-agent",
+            "worker.processor",
+            {"data_localities": ["eu-west"]},
+        )
+        self.registry.update_status(us_agent_id, AgentStatus.RUNNING)
+        self.registry.update_status(eu_agent_id, AgentStatus.RUNNING)
+
+        handlers = self.registry.resolve_handlers(
+            group="worker",
+            data_locality="eu-west",
+            status=AgentStatus.RUNNING,
+        )
+
+        assert [handler["id"] for handler in handlers] == [eu_agent_id]
+        assert self.registry.get(us_agent_id)["status"] == "running"
+        assert self.registry.audit_log[-1] == {
+            "agent_id": us_agent_id,
+            "data_locality": "eu-west",
+            "reason": "locality_mismatch",
+        }
+
+    def test_resolve_handlers_excludes_unavailable_handlers(self):
+        stopped_agent_id = self.registry.register(
+            "stopped-agent",
+            "worker.processor",
+            {"region": "us-east"},
+        )
+        running_agent_id = self.registry.register(
+            "running-agent",
+            "worker.processor",
+            {"region": "us-east"},
+        )
+        self.registry.update_status(stopped_agent_id, AgentStatus.STOPPED)
+        self.registry.update_status(running_agent_id, AgentStatus.RUNNING)
+
+        handlers = self.registry.resolve_handlers(
+            group="worker",
+            data_locality="us-east",
+        )
+
+        assert [handler["id"] for handler in handlers] == [running_agent_id]
+        assert {
+            "agent_id": stopped_agent_id,
+            "data_locality": "us-east",
+            "reason": "handler_unavailable",
+        } in self.registry.audit_log
+
+    def test_resolution_cache_invalidates_on_status_change(self):
+        agent_id = self.registry.register(
+            "agent",
+            "worker.processor",
+            {"region": "us-east"},
+        )
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert self.registry.resolve_handlers(
+            group="worker",
+            data_locality="us-east",
+        ) == []
+
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        handlers = self.registry.resolve_handlers(
+            group="worker",
+            data_locality="us-east",
+        )
+
+        assert [handler["id"] for handler in handlers] == [agent_id]
+
+    def test_resolution_cache_invalidates_on_delete(self):
+        agent_id = self.registry.register(
+            "agent",
+            "worker.processor",
+            {"region": "us-east"},
+        )
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve_handlers(
+            group="worker",
+            data_locality="us-east",
+        )
+
+        self.registry.delete(agent_id)
+
+        assert self.registry.resolve_handlers(
+            group="worker",
+            data_locality="us-east",
+        ) == []
 
 # 2019-01-23T10:28:57 update
 
