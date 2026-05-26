@@ -55,6 +55,37 @@ def test_denied_host_fails_before_network_dispatch():
     }
 
 
+def test_audit_report_summarizes_without_raw_url_secrets():
+    policy = OutboundRequestPolicy(["api.example.com"])
+
+    assert policy.is_allowed(
+        "https://user:token@API.EXAMPLE.COM./task?a=secret"
+    )
+    with pytest.raises(OutboundRequestPolicyError) as error:
+        policy.dispatch(
+            "https://user:private@evil.example.net/task?token=secret",
+            lambda url: "called",
+        )
+
+    report = policy.audit_report()
+
+    assert report["total"] == 2
+    assert report["allowed"] == 1
+    assert report["denied"] == 1
+    assert report["by_reason"] == {"allowed": 1, "host_not_allowed": 1}
+    assert report["by_normalized_host"] == {
+        "api.example.com": 1,
+        "evil.example.net": 1,
+    }
+    assert "evil.example.net" in str(error.value)
+    assert "user:" not in str(error.value)
+    assert "private" not in str(error.value)
+    assert "token=secret" not in str(report)
+
+    report["recent"][0]["reason"] = "changed"
+    assert policy.audit_events[0]["reason"] == "allowed"
+
+
 def test_allowed_host_dispatches_after_policy_check():
     policy = OutboundRequestPolicy(["api.example.com."])
 

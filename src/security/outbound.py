@@ -1,5 +1,6 @@
 """Outbound connector host allowlist policy."""
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List
 from urllib.parse import unquote, urlparse
@@ -52,6 +53,19 @@ class OutboundRequestPolicy:
     @property
     def audit_events(self) -> List[Dict[str, Any]]:
         return [dict(event) for event in self._audit_events]
+
+    def audit_report(self) -> Dict[str, Any]:
+        events = self.audit_events
+        return {
+            "total": len(events),
+            "allowed": sum(1 for event in events if event["allowed"]),
+            "denied": sum(1 for event in events if not event["allowed"]),
+            "by_reason": dict(Counter(event["reason"] for event in events)),
+            "by_normalized_host": dict(
+                Counter(event["normalized_host"] for event in events)
+            ),
+            "recent": events,
+        }
 
     def evaluate(self, url: str) -> OutboundRequestDecision:
         parsed = urlparse(url)
