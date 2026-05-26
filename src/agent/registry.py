@@ -1,10 +1,10 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
+from collections import Counter
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class AgentStatus(Enum):
@@ -17,12 +17,24 @@ class AgentStatus(Enum):
 
 
 class AgentRegistry:
+    SUPPORTED_RPC_PROTOCOL = "agent-rpc"
+    SUPPORTED_RPC_MAJOR = 1
+
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[Tuple, List[str]] = {}
+        self._protocol_audit: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        config = dict(config or {})
+        protocol = self._normalize_protocol(config)
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,7 +42,10 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
+            "rpc_protocol": protocol["protocol"],
+            "rpc_version": protocol["version"],
+            "rpc_major": protocol["major"],
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,12 +55,17 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_resolution_cache(agent_type)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -54,11 +74,99 @@ class AgentRegistry:
             agents = [a for a in agents if a["id"] in agent_ids]
         return list(agents)
 
+    def resolve_handlers(
+        self,
+        group: Optional[str] = None,
+        status: Optional[AgentStatus] = AgentStatus.RUNNING,
+        rpc_protocol: str = SUPPORTED_RPC_PROTOCOL,
+        rpc_version: str = "1.0.0",
+    ) -> List[Dict[str, Any]]:
+        try:
+            protocol = self._normalize_protocol(
+                {"rpc_protocol": rpc_protocol, "rpc_version": rpc_version}
+            )
+        except ValueError as error:
+            self._record_protocol_audit(
+                "deny",
+                str(error),
+                None,
+                rpc_protocol,
+                rpc_version,
+            )
+            return []
+
+        cache_key = (
+            group,
+            status.value if status else None,
+            protocol["protocol"],
+            protocol["major"],
+            tuple(sorted(self._agents)),
+        )
+        if cache_key not in self._resolution_cache:
+            self._resolution_cache[cache_key] = [
+                agent["id"]
+                for agent in self.list(status=status, group=group)
+                if agent["rpc_protocol"] == protocol["protocol"]
+                and agent["rpc_major"] == protocol["major"]
+            ]
+
+        return [
+            self._agents[agent_id]
+            for agent_id in self._resolution_cache[cache_key]
+            if agent_id in self._agents
+        ]
+
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_resolution_cache(self._agents[agent_id]["type"])
+        return True
+
+    def update_rpc_protocol(
+        self,
+        agent_id: str,
+        rpc_protocol: str,
+        rpc_version: str,
+    ) -> bool:
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            self._record_protocol_audit(
+                "deny",
+                "agent_not_found",
+                None,
+                rpc_protocol,
+                rpc_version,
+            )
+            return False
+
+        try:
+            protocol = self._normalize_protocol(
+                {"rpc_protocol": rpc_protocol, "rpc_version": rpc_version}
+            )
+        except ValueError as error:
+            self._record_protocol_audit(
+                "deny",
+                str(error),
+                agent,
+                rpc_protocol,
+                rpc_version,
+            )
+            return False
+
+        agent["rpc_protocol"] = protocol["protocol"]
+        agent["rpc_version"] = protocol["version"]
+        agent["rpc_major"] = protocol["major"]
+        agent["updated_at"] = time.time()
+        self._invalidate_resolution_cache(agent["type"])
+        self._record_protocol_audit(
+            "allow",
+            "compatible_protocol",
+            agent,
+            rpc_protocol,
+            rpc_version,
+        )
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +176,90 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_resolution_cache(agent["type"])
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    @property
+    def protocol_audit(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._protocol_audit]
+
+    def protocol_report(self) -> Dict[str, Any]:
+        events = self.protocol_audit
+        return {
+            "total": len(events),
+            "by_decision": dict(
+                Counter(event["decision"] for event in events)
+            ),
+            "by_reason": dict(Counter(event["reason"] for event in events)),
+            "cache_entries": len(self._resolution_cache),
+            "recent": events,
+        }
+
+    def _normalize_protocol(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        rpc_protocol = str(
+            config.get("rpc_protocol", self.SUPPORTED_RPC_PROTOCOL)
+        )
+        rpc_version = str(config.get("rpc_version", "1.0.0"))
+        major = self._parse_rpc_major(rpc_version)
+        if rpc_protocol != self.SUPPORTED_RPC_PROTOCOL:
+            raise ValueError("unsupported_rpc_protocol")
+        if major != self.SUPPORTED_RPC_MAJOR:
+            raise ValueError("incompatible_rpc_major")
+        return {
+            "protocol": rpc_protocol,
+            "version": rpc_version,
+            "major": major,
+        }
+
+    @staticmethod
+    def _parse_rpc_major(rpc_version: str) -> int:
+        major = rpc_version.split(".", 1)[0]
+        if not major.isdigit():
+            raise ValueError("invalid_rpc_version")
+        return int(major)
+
+    def _invalidate_resolution_cache(
+        self,
+        agent_type: Optional[str] = None,
+    ) -> None:
+        if agent_type is None:
+            self._resolution_cache.clear()
+            return
+        group = agent_type.split(".")[0]
+        stale_keys = [
+            key for key in self._resolution_cache if key[0] == group
+        ]
+        for key in stale_keys:
+            self._resolution_cache.pop(key, None)
+
+    def _record_protocol_audit(
+        self,
+        decision: str,
+        reason: str,
+        agent: Optional[Dict[str, Any]],
+        requested_protocol: str,
+        requested_version: str,
+    ) -> None:
+        event = {
+            "decision": decision,
+            "reason": reason,
+            "requested_protocol": requested_protocol,
+            "requested_rpc_major": None,
+        }
+        try:
+            event["requested_rpc_major"] = self._parse_rpc_major(
+                str(requested_version)
+            )
+        except ValueError:
+            event["requested_rpc_major"] = "invalid"
+        if agent is not None:
+            event["agent_id"] = agent["id"]
+            event["agent_type"] = agent["type"]
+            event["agent_status"] = agent["status"]
+        self._protocol_audit.append(event)
 
 # 2019-01-29T11:24:49 update
 

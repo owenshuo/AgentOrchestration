@@ -48,6 +48,126 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_resolve_handlers_filters_by_rpc_protocol_major(self):
+        compatible_id = self.registry.register(
+            "compatible",
+            "worker.processor",
+            {"rpc_protocol": "agent-rpc", "rpc_version": "1.2.0"},
+        )
+        self.registry.register(
+            "monitor",
+            "monitor.watcher",
+            {"rpc_protocol": "agent-rpc", "rpc_version": "1.0.0"},
+        )
+        self.registry.update_status(compatible_id, AgentStatus.RUNNING)
+
+        handlers = self.registry.resolve_handlers(
+            group="worker",
+            rpc_protocol="agent-rpc",
+            rpc_version="1.9.0",
+        )
+
+        assert [handler["id"] for handler in handlers] == [compatible_id]
+
+    def test_register_rejects_incompatible_rpc_protocol_config(self):
+        with pytest.raises(ValueError, match="incompatible_rpc_major"):
+            self.registry.register(
+                "future-agent",
+                "worker.processor",
+                {"rpc_protocol": "agent-rpc", "rpc_version": "2.0.0"},
+            )
+
+        assert self.registry.count() == 0
+
+    def test_protocol_upgrade_rejects_incompatible_running_handler(self):
+        agent_id = self.registry.register(
+            "agent",
+            "worker.processor",
+            {
+                "rpc_protocol": "agent-rpc",
+                "rpc_version": "1.0.0",
+                "token": "do-not-report",
+            },
+        )
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert not self.registry.update_rpc_protocol(
+            agent_id,
+            "agent-rpc",
+            "2.0.0",
+        )
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == "running"
+        assert agent["rpc_version"] == "1.0.0"
+        assert self.registry.protocol_audit[-1] == {
+            "decision": "deny",
+            "reason": "incompatible_rpc_major",
+            "requested_protocol": "agent-rpc",
+            "requested_rpc_major": 2,
+            "agent_id": agent_id,
+            "agent_type": "worker.processor",
+            "agent_status": "running",
+        }
+        assert "token" not in str(self.registry.protocol_audit[-1])
+        assert "do-not-report" not in str(self.registry.protocol_audit[-1])
+
+    def test_compatible_protocol_upgrade_invalidates_resolution_cache(self):
+        agent_id = self.registry.register(
+            "agent",
+            "worker.processor",
+            {"rpc_version": "1.0.0"},
+        )
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve_handlers(group="worker")
+        assert self.registry.protocol_report()["cache_entries"] == 1
+
+        assert self.registry.update_rpc_protocol(
+            agent_id,
+            "agent-rpc",
+            "1.4.0",
+        )
+
+        assert self.registry.protocol_report()["cache_entries"] == 0
+        handlers = self.registry.resolve_handlers(
+            group="worker",
+            rpc_version="1.9.0",
+        )
+        assert [handler["id"] for handler in handlers] == [agent_id]
+        assert self.registry.get(agent_id)["rpc_version"] == "1.4.0"
+        assert self.registry.protocol_audit[-1]["decision"] == "allow"
+
+    def test_protocol_report_summarizes_without_private_config(self):
+        agent_id = self.registry.register(
+            "agent",
+            "worker.processor",
+            {"rpc_version": "1.0.0", "secret": "private"},
+        )
+        self.registry.update_rpc_protocol(agent_id, "agent-rpc", "1.1.0")
+        self.registry.update_rpc_protocol(agent_id, "agent-rpc", "2.0.0")
+        self.registry.resolve_handlers(
+            group="worker",
+            rpc_protocol="other-rpc",
+            rpc_version="1.0.0",
+        )
+
+        report = self.registry.protocol_report()
+
+        assert report["total"] == 3
+        assert report["by_decision"] == {"allow": 1, "deny": 2}
+        assert report["by_reason"] == {
+            "compatible_protocol": 1,
+            "incompatible_rpc_major": 1,
+            "unsupported_rpc_protocol": 1,
+        }
+        assert "secret" not in str(report)
+        assert "private" not in str(report)
+
+        report["recent"][0]["reason"] = "changed"
+        assert self.registry.protocol_audit[0]["reason"] == (
+            "compatible_protocol"
+        )
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
