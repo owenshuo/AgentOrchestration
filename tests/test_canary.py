@@ -108,6 +108,56 @@ def test_sample_batch_rolls_back_when_any_canary_sample_fails():
     assert "queue_backlog_exceeded" in decision.reasons
     assert decision.dashboard_metrics["sample_0.worker.queue_backlog"] == 5
     assert decision.dashboard_metrics["sample_1.worker.queue_backlog"] == 60
+    assert decision.dashboard_metrics["summary.sample_count"] == 2
+    assert decision.dashboard_metrics["summary.failing_samples"] == 1
+    assert (
+        decision.dashboard_metrics["summary.reason.queue_backlog_exceeded"]
+        == 1
+    )
+
+
+def test_sample_batch_reports_combined_worker_and_scheduler_failures():
+    analyzer = CanaryAnalyzer(
+        CanaryThresholds(
+            max_queue_backlog=50,
+            max_lease_renewal_failures=0,
+            max_scheduler_queue_backlog=75,
+        )
+    )
+
+    decision = analyzer.evaluate_samples(
+        [
+            healthy_metrics(
+                queue_backlog=80,
+                lease_renewal_failures=2,
+                scheduler_queue_backlog=100,
+            ),
+            healthy_metrics(),
+        ]
+    )
+
+    assert decision.promote is False
+    assert decision.rollback is True
+    assert decision.dashboard_metrics["summary.sample_count"] == 2
+    assert decision.dashboard_metrics["summary.failing_samples"] == 1
+    assert (
+        decision.dashboard_metrics["summary.reason.queue_backlog_exceeded"]
+        == 1
+    )
+    assert (
+        decision.dashboard_metrics["summary.reason.lease_renewal_failures"]
+        == 1
+    )
+    assert (
+        decision.dashboard_metrics[
+            "summary.reason.scheduler_queue_backlog_exceeded"
+        ]
+        == 1
+    )
+    assert decision.dashboard_metrics["sample_0.worker.queue_backlog"] == 80
+    assert (
+        decision.dashboard_metrics["sample_0.scheduler.queue_backlog"] == 100
+    )
 
 
 def test_sample_batch_requires_at_least_one_metrics_sample():

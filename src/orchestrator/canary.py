@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping
 
@@ -78,6 +79,20 @@ class CanaryAnalyzer:
             reasons.extend(decision.reasons)
 
         rollback = any(decision.rollback for decision in decisions)
+        dashboard.update(
+            {
+                "summary.sample_count": len(decisions),
+                "summary.failing_samples": sum(
+                    1 for decision in decisions if decision.rollback
+                ),
+            }
+        )
+        dashboard.update(
+            {
+                f"summary.reason.{reason}": count
+                for reason, count in Counter(reasons).items()
+            }
+        )
         return CanaryDecision(
             promote=not rollback,
             rollback=rollback,
