@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,82 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_urgent_workflow_lane_budget_defers_only_exhausted_class(self):
+        scheduler = TaskScheduler(priority_budgets={"urgent": 1, "default": 1})
+        scheduler.enqueue(
+            {"type": "urgent-1", "priority_class": "urgent"},
+            priority=10,
+        )
+        scheduler.enqueue(
+            {"type": "urgent-2", "priority_class": "urgent"},
+            priority=10,
+        )
+        scheduler.enqueue(
+            {"type": "default", "priority_class": "default"},
+            priority=1,
+        )
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+        third = asyncio.run(scheduler.dequeue())
+
+        assert first["type"] == "urgent-1"
+        assert second["type"] == "default"
+        assert third is None
+        assert any(
+            record["decision"] == "deferred"
+            and record["reason"] == "priority_class_budget_exhausted"
+            for record in scheduler.audit_records()
+        )
+
+    def test_priority_class_budget_preserves_task_until_capacity_returns(self):
+        scheduler = TaskScheduler(priority_budgets={"urgent": 1})
+        scheduler.enqueue(
+            {"type": "urgent-1", "priority_class": "urgent"},
+            priority=10,
+        )
+        scheduler.enqueue(
+            {"type": "urgent-2", "priority_class": "urgent"},
+            priority=10,
+        )
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue())
+        blocked = asyncio.run(scheduler.dequeue())
+
+        assert first["type"] == "urgent-1"
+        assert blocked is None
+
+        assert scheduler.complete(first["id"])
+        resumed = asyncio.run(scheduler.dequeue())
+
+        assert resumed["type"] == "urgent-2"
+
+    def test_scheduler_audit_records_are_bounded_and_sanitized(self):
+        scheduler = TaskScheduler(
+            priority_budgets={"urgent": 0},
+            audit_limit=2,
+        )
+        scheduler.enqueue(
+            {
+                "type": "secret-task",
+                "priority_class": "urgent",
+                "payload": {"token": "do-not-record"},
+            },
+            priority=10,
+        )
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        records = scheduler.audit_records()
+        assert len(records) == 2
+        assert records[-1]["reason"] == "priority_class_budget_exhausted"
+        assert "payload" not in records[-1]
+        assert "token" not in repr(records)
 
 # 2019-01-09T19:07:03 update
 
