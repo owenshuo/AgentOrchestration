@@ -74,4 +74,4 @@ def _toast_verb(variant: str) -> str:
     try:
         return TOAST_MESSAGES[variant]
     except KeyError as error:
-        raise ValueError(f"unsupported toast variant: {variant}") from error
+        raise ValueError("unsupported toast variant") from error
