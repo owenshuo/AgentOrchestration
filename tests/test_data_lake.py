@@ -128,3 +128,64 @@ def test_audit_report_lists_writes_by_purpose_and_owner():
             "data_classes": ["operational"],
         },
     ]
+
+
+def test_governance_report_lists_policies_and_rejections_without_payloads():
+    registry = DataClassificationRegistry()
+    registry.register_destination("lake.aggregate", {"aggregate"})
+    registry.register_destination("lake.security", {"operational", "audit"})
+    pipeline = DataLakeIngestionPipeline(registry)
+
+    pipeline.ingest(
+        {"task_id": "task-1", "token": "do-not-record"},
+        IngestionManifest(
+            purpose="incident-investigation",
+            data_class="operational",
+            owner="security",
+            destination="lake.security",
+        ),
+    )
+    with pytest.raises(DataLakePolicyError):
+        pipeline.ingest(
+            {"task_id": "task-2", "token": "do-not-record"},
+            IngestionManifest(
+                purpose="incident-investigation",
+                data_class="operational",
+                owner="security",
+                destination="lake.aggregate",
+            ),
+        )
+
+    report = pipeline.governance_report()
+
+    assert report["destination_policies"] == [
+        {
+            "destination": "lake.aggregate",
+            "allowed_data_classes": ["aggregate"],
+        },
+        {
+            "destination": "lake.security",
+            "allowed_data_classes": ["audit", "operational"],
+        },
+    ]
+    assert report["writes_by_purpose_owner"][0]["write_count"] == 1
+    assert report["rejected_writes"] == [
+        {
+            "purpose": "incident-investigation",
+            "owner": "security",
+            "data_class": "operational",
+            "destination": "lake.aggregate",
+            "reason": "destination_policy_denied",
+        },
+    ]
+    assert "token" not in repr(report)
+
+
+def test_policy_report_returns_defensive_values():
+    registry = DataClassificationRegistry()
+    registry.register_destination("lake.security", {"operational"})
+
+    report = registry.policy_report()
+    report[0]["allowed_data_classes"].append("financial")
+
+    assert registry.allows("lake.security", "financial") is False

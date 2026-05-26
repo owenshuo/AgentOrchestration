@@ -55,6 +55,18 @@ class DataClassificationRegistry:
         policy = self._policies.get(destination)
         return bool(policy and data_class in policy.allowed_data_classes)
 
+    def policy_report(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "destination": policy.destination,
+                "allowed_data_classes": sorted(policy.allowed_data_classes),
+            }
+            for policy in sorted(
+                self._policies.values(),
+                key=lambda item: item.destination,
+            )
+        ]
+
     def _require_text(self, field_name: str, value: str) -> str:
         if not isinstance(value, str) or not value.strip():
             raise DataLakePolicyError(f"{field_name} is required")
@@ -126,6 +138,23 @@ class DataLakeIngestionPipeline:
             }
             for summary in report.values()
         ]
+
+    def governance_report(self) -> Dict[str, Any]:
+        return {
+            "destination_policies": self.registry.policy_report(),
+            "writes_by_purpose_owner": self.audit_report(),
+            "rejected_writes": [
+                {
+                    "purpose": record["purpose"],
+                    "owner": record["owner"],
+                    "data_class": record["data_class"],
+                    "destination": record["destination"],
+                    "reason": record.get("reason"),
+                }
+                for record in self.audit_records
+                if record["decision"] == "rejected"
+            ],
+        }
 
     def _validate_manifest(self, manifest: IngestionManifest) -> None:
         for field_name in ("purpose", "data_class", "owner", "destination"):
