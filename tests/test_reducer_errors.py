@@ -99,3 +99,47 @@ def test_reducer_errors_are_bounded_and_sanitized():
     assert errors[-1]["task_id"] == "task-104"
     assert all("payload" not in error for error in errors)
     assert all("secret" not in str(error) for error in errors)
+
+
+def test_reducer_error_report_summarizes_without_private_payloads():
+    engine = OrchestrationEngine()
+    stale_task = {
+        "id": "task-stale",
+        "state": "queued",
+        "revision": 2,
+        "attempt": 0,
+        "payload": {"token": "private-token"},
+    }
+    terminal_task = {
+        "id": "task-terminal",
+        "state": "completed",
+        "revision": 4,
+        "attempt": 1,
+        "payload": {"secret": "private-secret"},
+    }
+
+    assert not engine._reduce_task_state(
+        stale_task,
+        "running",
+        expected_revision=1,
+        expected_attempt=0,
+    )
+    assert not engine._reduce_task_state(
+        terminal_task,
+        "failed",
+        expected_revision=4,
+        expected_attempt=1,
+    )
+
+    report = engine.reducer_error_report()
+
+    assert report["total"] == 2
+    assert report["by_reason"] == {"stale_revision": 1, "terminal_state": 1}
+    assert report["by_attempted_state"] == {"running": 1, "failed": 1}
+    assert len(report["recent"]) == 2
+    assert "payload" not in str(report)
+    assert "private-token" not in str(report)
+    assert "private-secret" not in str(report)
+
+    report["recent"][0]["reason"] = "mutated"
+    assert engine.reducer_errors[0]["reason"] == "stale_revision"

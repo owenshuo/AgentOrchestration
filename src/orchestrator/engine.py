@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Deque, Dict, List, Optional
 
@@ -38,6 +38,17 @@ class OrchestrationEngine:
     @property
     def reducer_errors(self) -> List[Dict[str, Any]]:
         return [dict(error) for error in self._reducer_errors]
+
+    def reducer_error_report(self) -> Dict[str, Any]:
+        errors = self.reducer_errors
+        return {
+            "total": len(errors),
+            "by_reason": dict(Counter(error["reason"] for error in errors)),
+            "by_attempted_state": dict(
+                Counter(error["attempted_state"] for error in errors)
+            ),
+            "recent": errors,
+        }
 
     def _record_reducer_error(
         self,
