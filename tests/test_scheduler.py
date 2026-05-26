@@ -1,4 +1,4 @@
-import pytest
+import asyncio
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +12,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +19,86 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_rate_limit_is_checked_before_prefetch_claims_task(self):
+        self.scheduler.set_prefetch_rate_limit(
+            queue="default",
+            max_claims=1,
+            window_seconds=60.0,
+        )
+        first_id = self.scheduler.enqueue({"type": "first"})
+        second_id = self.scheduler.enqueue({"type": "second"})
+
+        first = asyncio.run(self.scheduler.prefetch(limit=1))
+        second = asyncio.run(self.scheduler.prefetch(limit=1))
+
+        assert [task["id"] for task in first] == [first_id]
+        assert second == []
+        assert second_id not in self.scheduler._in_flight
+        assert self.scheduler._queues["default"].peek()["id"] == second_id
+        assert self.scheduler.audit_report()[-1]["action"] == (
+            "prefetch_deferred"
+        )
+
+    def test_prefetch_respects_limit_before_local_buffer_fill(self):
+        self.scheduler.set_prefetch_rate_limit(
+            queue="default",
+            max_claims=2,
+            window_seconds=60.0,
+        )
+        self.scheduler.enqueue({"type": "first"})
+        self.scheduler.enqueue({"type": "second"})
+        self.scheduler.enqueue({"type": "third"})
+
+        tasks = asyncio.run(self.scheduler.prefetch(limit=3))
+
+        assert [task["type"] for task in tasks] == ["first", "second"]
+        assert self.scheduler._queues["default"].peek()["type"] == "third"
+        assert self.scheduler.audit_report()[-1] == {
+            "action": "prefetch_deferred",
+            "queue": "default",
+            "reason": "rate_limit_exceeded",
+            "claimed_count": 2,
+            "timestamp": self.scheduler.audit_report()[-1]["timestamp"],
+        }
+
+    def test_rate_window_allows_prefetch_after_window_expires(self):
+        self.scheduler.set_prefetch_rate_limit(
+            queue="default",
+            max_claims=1,
+            window_seconds=0.01,
+        )
+        self.scheduler.enqueue({"type": "first"})
+        self.scheduler.enqueue({"type": "second"})
+
+        assert len(asyncio.run(self.scheduler.prefetch(limit=1))) == 1
+        import time
+        time.sleep(0.02)
+        assert len(asyncio.run(self.scheduler.prefetch(limit=1))) == 1
+
+    def test_prefetch_audit_does_not_include_task_payload(self):
+        self.scheduler.set_prefetch_rate_limit(
+            queue="default",
+            max_claims=1,
+            window_seconds=60.0,
+        )
+        self.scheduler.enqueue({"type": "first", "payload": {"secret": "x"}})
+
+        asyncio.run(self.scheduler.prefetch(limit=1))
+
+        assert "secret" not in str(self.scheduler.audit_report())
 
 # 2019-01-09T19:07:03 update
 
