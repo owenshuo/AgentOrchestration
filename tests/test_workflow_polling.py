@@ -1,4 +1,4 @@
-from src.orchestrator.workflow import StepStatus, WorkflowManager
+from src.orchestrator.workflow import StepStatus, WorkflowManager, WorkflowStep
 
 
 def test_deleted_workflow_rejects_stale_poll_commit_without_state_change():
@@ -73,3 +73,33 @@ def test_active_poll_commit_advances_revision_once():
     assert manager.poll_coordinator.audit_records[-1]["reason"] == (
         "poll_committed"
     )
+
+
+def test_execute_workflow_stops_after_deletion_during_step_poll():
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("delete during execution")
+    calls = []
+
+    def delete_workflow():
+        calls.append("delete")
+        assert manager.delete_workflow(workflow.id) is True
+
+    def stale_step():
+        calls.append("stale")
+
+    first = WorkflowStep("delete", delete_workflow)
+    second = WorkflowStep("stale", stale_step)
+    workflow.add_step(first).add_step(second)
+
+    assert manager.execute_workflow(workflow.id) is False
+
+    assert calls == ["delete"]
+    assert manager.get_workflow(workflow.id) is None
+    assert first.status == StepStatus.COMPLETED
+    assert second.status == StepStatus.PENDING
+    rejected = manager.poll_coordinator.audit_records[-1]
+    assert rejected["decision"] == "rejected"
+    assert rejected["reason"] == "workflow_deleted"
+    assert rejected["workflow_id"] == workflow.id
+    assert "payload" not in rejected
+    assert "result" not in rejected

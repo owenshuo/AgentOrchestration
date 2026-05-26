@@ -224,6 +224,10 @@ class WorkflowManager:
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
+            poll_token = self.poll_coordinator.begin_poll(workflow_id)
+            if poll_token is None:
+                return False
+
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
@@ -232,10 +236,20 @@ class WorkflowManager:
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                self.poll_coordinator.commit_poll(
+                    poll_token,
+                    StepStatus.FAILED,
+                )
+                return False
+
+            if not self.poll_coordinator.commit_poll(
+                poll_token,
+                StepStatus.RUNNING,
+            ):
                 return False
 
         workflow.status = StepStatus.COMPLETED
+        workflow.revision += 1
         return True
 
 # 2019-03-27T19:58:07 update
