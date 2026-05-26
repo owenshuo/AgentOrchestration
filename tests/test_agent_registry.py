@@ -140,6 +140,49 @@ class TestAgentRegistry:
             data_locality="us-east",
         ) == []
 
+    def test_resolution_report_summarizes_without_handler_config(self):
+        stopped_agent_id = self.registry.register(
+            "stopped-agent",
+            "worker.processor",
+            {
+                "region": "us-east",
+                "secret": "do-not-report",
+            },
+        )
+        eu_agent_id = self.registry.register(
+            "eu-agent",
+            "worker.processor",
+            {
+                "region": "eu-west",
+                "token": "private-token",
+            },
+        )
+        self.registry.update_status(stopped_agent_id, AgentStatus.STOPPED)
+        self.registry.update_status(eu_agent_id, AgentStatus.RUNNING)
+
+        handlers = self.registry.resolve_handlers(
+            group="worker",
+            data_locality="us-east",
+        )
+        report = self.registry.resolution_report()
+
+        assert handlers == []
+        assert report["total_decisions"] == 2
+        assert report["by_reason"] == {
+            "handler_unavailable": 1,
+            "locality_mismatch": 1,
+        }
+        assert report["by_data_locality"] == {"us-east": 2}
+        assert report["cache_entries"] == 1
+        assert len(report["recent"]) == 2
+        assert "config" not in str(report)
+        assert "secret" not in str(report)
+        assert "do-not-report" not in str(report)
+        assert "private-token" not in str(report)
+
+        report["recent"][0]["reason"] = "changed"
+        assert self.registry.audit_log[0]["reason"] == "handler_unavailable"
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update

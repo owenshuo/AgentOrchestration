@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from collections import Counter
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -108,6 +109,24 @@ class AgentRegistry:
 
         self._resolution_cache[cache_key] = [agent["id"] for agent in resolved]
         return resolved
+
+    def resolution_report(self) -> Dict[str, Any]:
+        audit_events = [dict(event) for event in self.audit_log]
+        return {
+            "total_decisions": len(audit_events),
+            "by_reason": dict(
+                Counter(event["reason"] for event in audit_events)
+            ),
+            "by_data_locality": dict(
+                Counter(
+                    event["data_locality"]
+                    for event in audit_events
+                    if event["data_locality"]
+                )
+            ),
+            "cache_entries": len(self._resolution_cache),
+            "recent": audit_events,
+        }
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
