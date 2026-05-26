@@ -47,6 +47,20 @@ def test_request_returns_empty_dict_for_empty_success_body(monkeypatch):
     assert client.stop_agent("agent-1") == {}
 
 
+def test_request_returns_empty_dict_for_whitespace_success_body(monkeypatch):
+    monkeypatch.setattr(
+        "src.sdk.client.urlopen",
+        lambda request: _Response(b" \n\t ", status=202),
+    )
+
+    client = OrchestratorClient(
+        base_url="https://example.test",
+        api_key="token",
+    )
+
+    assert client.stop_agent("agent-1") == {}
+
+
 def test_request_still_decodes_json_success_body(monkeypatch):
     expected = {"id": "agent-1", "status": "deleted"}
     payload = json.dumps(expected).encode()

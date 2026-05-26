@@ -28,7 +28,7 @@ class OrchestratorClient:
         try:
             with urlopen(req) as resp:
                 payload = resp.read()
-                if resp.status == 204 or not payload:
+                if resp.status == 204 or not payload.strip():
                     return {}
                 return json.loads(payload.decode())
         except HTTPError as e:
