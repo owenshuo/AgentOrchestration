@@ -1,25 +1,77 @@
 """Agent Sandbox — Isolated execution environment for agents."""
 
-import os
 import tempfile
 import resource
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from pathlib import Path
 
 
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+    DEFAULTS = {
+        "cpu_time": 60,
+        "memory_mb": 512,
+        "disk_mb": 100,
+    }
+
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+    ):
+        cpu_time = self._validate_limit("cpu_time", cpu_time)
+        memory_mb = self._validate_limit("memory_mb", memory_mb)
+        disk_mb = self._validate_limit("disk_mb", disk_mb)
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
 
+    @classmethod
+    def from_config(cls, config: Any) -> "ResourceLimits":
+        return cls(
+            cpu_time=cls._config_value(config, "cpu_time"),
+            memory_mb=cls._config_value(config, "memory_mb"),
+            disk_mb=cls._config_value(config, "disk_mb"),
+        )
+
+    @classmethod
+    def _config_value(cls, config: Any, field_name: str) -> int:
+        return config.get(
+            f"sandbox.{field_name}",
+            cls.DEFAULTS[field_name],
+        )
+
+    @staticmethod
+    def _validate_limit(field_name: str, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be numeric")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError(f"{field_name} must be numeric")
+            try:
+                value = int(value)
+            except ValueError as exc:
+                raise ValueError(f"{field_name} must be numeric") from exc
+        if not isinstance(value, int):
+            raise ValueError(f"{field_name} must be numeric")
+        if value < 0:
+            raise ValueError(f"{field_name} must be non-negative")
+        return value
+
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        self.base_path = Path(
+            base_path or tempfile.mkdtemp(prefix="ao_sandbox_")
+        )
         self._sandboxes: Dict[str, Path] = {}
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
         sandbox_path = self.base_path / agent_id
         sandbox_path.mkdir(parents=True, exist_ok=True)
         self._sandboxes[agent_id] = sandbox_path
@@ -38,10 +90,13 @@ class AgentSandbox:
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:

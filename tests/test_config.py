@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.agent.sandbox import ResourceLimits
 
 
 class TestConfig:
@@ -31,6 +32,68 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_resource_limits_from_config_defaults(self):
+        limits = ResourceLimits.from_config(Config())
+
+        assert limits.cpu_time == 60
+        assert limits.memory_mb == 512
+        assert limits.disk_mb == 100
+
+    def test_resource_limits_from_config_accepts_numeric_strings(self):
+        config = Config()
+        config.set("sandbox.cpu_time", "120")
+        config.set("sandbox.memory_mb", "1024")
+        config.set("sandbox.disk_mb", "2048")
+
+        limits = ResourceLimits.from_config(config)
+
+        assert limits.cpu_time == 120
+        assert limits.memory_mb == 1024
+        assert limits.disk_mb == 2048
+
+    @pytest.mark.parametrize(
+        ("field_name", "value", "message"),
+        [
+            ("cpu_time", -1, "cpu_time must be non-negative"),
+            ("memory_mb", "-1", "memory_mb must be non-negative"),
+            ("disk_mb", -1, "disk_mb must be non-negative"),
+            ("cpu_time", "slow", "cpu_time must be numeric"),
+            ("memory_mb", "", "memory_mb must be numeric"),
+            ("disk_mb", True, "disk_mb must be numeric"),
+        ],
+    )
+    def test_resource_limits_from_config_rejects_invalid_values(
+        self,
+        field_name,
+        value,
+        message,
+    ):
+        config = Config()
+        config.set(f"sandbox.{field_name}", value)
+
+        with pytest.raises(ValueError, match=message):
+            ResourceLimits.from_config(config)
+
+    @pytest.mark.parametrize(
+        ("field_name", "value", "message"),
+        [
+            ("cpu_time", -1, "cpu_time must be non-negative"),
+            ("memory_mb", -1, "memory_mb must be non-negative"),
+            ("disk_mb", -1, "disk_mb must be non-negative"),
+            ("cpu_time", object(), "cpu_time must be numeric"),
+        ],
+    )
+    def test_resource_limits_constructor_rejects_invalid_values(
+        self,
+        field_name,
+        value,
+        message,
+    ):
+        kwargs = {field_name: value}
+
+        with pytest.raises(ValueError, match=message):
+            ResourceLimits(**kwargs)
 
 # 2019-02-01T18:58:35 update
 
