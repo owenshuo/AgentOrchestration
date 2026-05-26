@@ -2,8 +2,25 @@
 
 from .server import create_app
 from .routes import router
+from .auth import (
+    AuthDecision,
+    AuthorizationResult,
+    CollaborationAuthService,
+    Principal,
+    SavedViewShareRequest,
+    WorkspaceRole,
+)
 
-__all__ = ["create_app", "router"]
+__all__ = [
+    "AuthDecision",
+    "AuthorizationResult",
+    "CollaborationAuthService",
+    "Principal",
+    "SavedViewShareRequest",
+    "WorkspaceRole",
+    "create_app",
+    "router",
+]
 
 # 2019-02-04T12:25:11 update
 
