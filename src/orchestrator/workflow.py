@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -14,7 +15,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -33,6 +40,9 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.lifecycle = "active"
+        self.revision = 0
+        self.poll_attempt = 0
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -43,9 +53,151 @@ class Workflow:
         return self._step_map.get(step_id)
 
 
+@dataclass(frozen=True)
+class WorkflowPollToken:
+    workflow_id: str
+    attempt: int
+    revision: int
+
+
+class WorkflowPollCoordinator:
+    """Guards task poll transitions against stale workflow lifecycle state."""
+
+    def __init__(
+        self,
+        workflows: Dict[str, Workflow],
+        deleted_revisions: Dict[str, int],
+    ):
+        self._workflows = workflows
+        self._deleted_revisions = deleted_revisions
+        self.audit_records: List[Dict[str, Any]] = []
+
+    def begin_poll(self, workflow_id: str) -> Optional[WorkflowPollToken]:
+        workflow = self._workflows.get(workflow_id)
+        if workflow is None:
+            self._record(
+                "rejected",
+                workflow_id,
+                reason="workflow_deleted",
+                revision=self._deleted_revisions.get(workflow_id),
+            )
+            return None
+        if workflow.lifecycle != "active":
+            self._record(
+                "rejected",
+                workflow_id,
+                reason="workflow_not_active",
+                revision=workflow.revision,
+            )
+            return None
+
+        workflow.poll_attempt += 1
+        token = WorkflowPollToken(
+            workflow_id=workflow_id,
+            attempt=workflow.poll_attempt,
+            revision=workflow.revision,
+        )
+        self._record(
+            "accepted",
+            workflow_id,
+            reason="poll_started",
+            attempt=token.attempt,
+            revision=token.revision,
+        )
+        return token
+
+    def commit_poll(
+        self,
+        token: WorkflowPollToken,
+        status: StepStatus,
+    ) -> bool:
+        workflow = self._workflows.get(token.workflow_id)
+        if workflow is None:
+            self._record(
+                "rejected",
+                token.workflow_id,
+                reason="workflow_deleted",
+                attempt=token.attempt,
+                revision=self._deleted_revisions.get(token.workflow_id),
+                token_revision=token.revision,
+            )
+            return False
+        if workflow.lifecycle != "active":
+            self._record(
+                "rejected",
+                token.workflow_id,
+                reason="workflow_not_active",
+                attempt=token.attempt,
+                revision=workflow.revision,
+                token_revision=token.revision,
+            )
+            return False
+        if workflow.revision != token.revision:
+            self._record(
+                "rejected",
+                token.workflow_id,
+                reason="stale_revision",
+                attempt=token.attempt,
+                revision=workflow.revision,
+                token_revision=token.revision,
+            )
+            return False
+        if workflow.poll_attempt != token.attempt:
+            self._record(
+                "rejected",
+                token.workflow_id,
+                reason="stale_attempt",
+                attempt=token.attempt,
+                current_attempt=workflow.poll_attempt,
+                revision=workflow.revision,
+            )
+            return False
+
+        workflow.status = status
+        workflow.revision += 1
+        self._record(
+            "accepted",
+            token.workflow_id,
+            reason="poll_committed",
+            attempt=token.attempt,
+            revision=workflow.revision,
+        )
+        return True
+
+    def mark_deleted(self, workflow: Workflow) -> None:
+        workflow.lifecycle = "deleted"
+        workflow.revision += 1
+        self._deleted_revisions[workflow.id] = workflow.revision
+        self._record(
+            "accepted",
+            workflow.id,
+            reason="workflow_deleted",
+            revision=workflow.revision,
+        )
+
+    def _record(
+        self,
+        decision: str,
+        workflow_id: str,
+        **fields: Any,
+    ) -> None:
+        self.audit_records.append(
+            {
+                "decision": decision,
+                "workflow_id": workflow_id,
+                **fields,
+            }
+        )
+
+
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._deleted_workflow_revisions: Dict[str, int] = {}
+        self.poll_coordinator = WorkflowPollCoordinator(
+            self._workflows,
+            self._deleted_workflow_revisions,
+        )
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -59,7 +211,11 @@ class WorkflowManager:
         return list(self._workflows.values())
 
     def delete_workflow(self, workflow_id: str) -> bool:
-        return self._workflows.pop(workflow_id, None) is not None
+        workflow = self._workflows.pop(workflow_id, None)
+        if workflow is None:
+            return False
+        self.poll_coordinator.mark_deleted(workflow)
+        return True
 
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
