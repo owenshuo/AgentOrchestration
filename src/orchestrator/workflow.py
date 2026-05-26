@@ -1,7 +1,8 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from uuid import uuid4
 
 
@@ -14,7 +15,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -25,11 +32,28 @@ class WorkflowStep:
         self.error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class WorkflowParameter:
+    name: str
+    alias: Optional[str] = None
+    required: bool = True
+
+    @property
+    def binding_key(self) -> str:
+        return self.alias or self.name
+
+
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        parameters: Optional[Sequence[WorkflowParameter]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.parameters = list(parameters or [])
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
@@ -46,10 +70,22 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit: List[Dict[str, str]] = []
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        parameters: Optional[Sequence[WorkflowParameter]] = None,
+    ) -> Workflow:
+        self._validate_parameter_aliases(parameters or [])
+        workflow = Workflow(name, description, parameters)
         self._workflows[workflow.id] = workflow
+        self._record_audit(
+            action="workflow_registration",
+            decision="accepted",
+            workflow_id=workflow.id,
+        )
         return workflow
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
@@ -81,6 +117,53 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def audit_records(self) -> List[Dict[str, str]]:
+        return list(self._audit)
+
+    def _validate_parameter_aliases(
+        self,
+        parameters: Sequence[WorkflowParameter],
+    ) -> None:
+        seen: Dict[str, str] = {}
+        for parameter in parameters:
+            binding_key = parameter.binding_key
+            if not binding_key:
+                self._record_audit(
+                    action="workflow_registration",
+                    decision="rejected",
+                    reason="empty_parameter_binding",
+                )
+                raise ValueError(
+                    "workflow parameter names and aliases must be non-empty"
+                )
+            if binding_key in seen:
+                self._record_audit(
+                    action="workflow_registration",
+                    decision="rejected",
+                    reason="duplicate_parameter_alias",
+                )
+                raise ValueError(
+                    f"duplicate workflow parameter alias: {binding_key}"
+                )
+            seen[binding_key] = parameter.name
+
+    def _record_audit(
+        self,
+        action: str,
+        decision: str,
+        workflow_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        record = {
+            "action": action,
+            "decision": decision,
+        }
+        if workflow_id:
+            record["workflow_id"] = workflow_id
+        if reason:
+            record["reason"] = reason
+        self._audit.append(record)
 
 # 2019-03-27T19:58:07 update
 
